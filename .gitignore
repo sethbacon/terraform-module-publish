@@ -1,0 +1,5 @@
+node_modules/
+*.tsbuildinfo
+coverage/
+.DS_Store
+# dist/ is intentionally committed.

@@ -1,0 +1,84 @@
+name: Terraform module publish
+description: >-
+  Publish a Terraform/OpenTofu module version to a self-hosted private registry
+  (terraform-registry-backend) or to HCP Terraform / Terraform Enterprise. The
+  registry protocol is binary-agnostic, so this works for Terraform and OpenTofu
+  consumers alike.
+author: sethbacon
+branding:
+  icon: upload-cloud
+  color: purple
+
+inputs:
+  registry-type:
+    description: '"private" (self-hosted registry) or "hcp" (HCP Terraform / TFE).'
+    required: true
+  namespace:
+    description: Module namespace / organization.
+    required: true
+  name:
+    description: Module name.
+    required: true
+  provider:
+    description: Module provider / target system.
+    required: true
+  version:
+    description: Module version to publish (e.g. 1.2.3).
+    required: true
+  # --- private registry ---
+  registry-url:
+    description: Base URL of the private registry (required for registry-type=private).
+    required: false
+    default: ""
+  api-key:
+    description: API key for the private registry (Bearer). Required for registry-type=private.
+    required: false
+    default: ""
+  skip-tls-verify:
+    description: Disable TLS verification for the private registry (private-CA endpoints only).
+    required: false
+    default: "false"
+  # --- HCP / TFE ---
+  hcp-address:
+    description: HCP Terraform / TFE base URL.
+    required: false
+    default: https://app.terraform.io
+  hcp-token:
+    description: HCP/TFE API token (Bearer). Required for registry-type=hcp.
+    required: false
+    default: ""
+  vcs-repo-identifier:
+    description: VCS repo identifier (org/repo) used to create the module if missing.
+    required: false
+    default: ""
+  vcs-branch:
+    description: VCS branch for a VCS-connected HCP module.
+    required: false
+    default: main
+  vcs-oauth-token-id:
+    description: HCP VCS OAuth token ID used to create the module if missing.
+    required: false
+    default: ""
+  commit-sha:
+    description: Commit SHA to associate with the new HCP module version.
+    required: false
+    default: ""
+  # --- common ---
+  wait-for-publish:
+    description: Wait until the version is available/ready in the registry.
+    required: false
+    default: "false"
+  timeout-seconds:
+    description: Wait timeout in seconds (when wait-for-publish is true).
+    required: false
+    default: "180"
+
+outputs:
+  published:
+    description: '"true" when a version was published (or sync triggered); "false" if it already existed.'
+  message:
+    description: Human-readable status message.
+
+runs:
+  using: node20
+  main: dist/index.js

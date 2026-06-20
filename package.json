@@ -1,0 +1,21 @@
+{
+  "name": "terraform-module-publish",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GitHub Action: publish a Terraform/OpenTofu module version to a self-hosted registry or HCP Terraform / TFE.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "ncc build src/index.ts -o dist --minify --no-source-map-register",
+    "test": "vitest run",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@actions/core": "^1.11.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@vercel/ncc": "^0.38.1",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
