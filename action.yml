@@ -1,9 +1,5 @@
 name: Terraform module publish
-description: >-
-  Publish a Terraform/OpenTofu module version to a self-hosted private registry
-  (terraform-registry-backend) or to HCP Terraform / Terraform Enterprise. The
-  registry protocol is binary-agnostic, so this works for Terraform and OpenTofu
-  consumers alike.
+description: Publish a Terraform/OpenTofu module version to a self-hosted registry or HCP Terraform / Terraform Enterprise.
 author: sethbacon
 branding:
   icon: upload-cloud
