@@ -1,5 +1,8 @@
 # module-publish
 
+[![GitHub release](https://img.shields.io/github/v/release/sethbacon/terraform-module-publish?logo=github&label=Marketplace&color=2ea44f)](https://github.com/marketplace/actions/terraform-module-publish)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
 Publish a Terraform/OpenTofu module version to a **self-hosted private registry**
 (`terraform-registry-backend`) or to **HCP Terraform / Terraform Enterprise**.
 The registry protocol is binary-agnostic — it works for Terraform and OpenTofu
