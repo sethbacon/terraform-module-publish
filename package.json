@@ -13,7 +13,7 @@
     "@actions/core": "^1.11.1"
   },
   "overrides": {
-    "undici": "^6.27.0"
+    "undici": "^6.28.0"
   },
   "devDependencies": {
     "@types/node": "^24",
