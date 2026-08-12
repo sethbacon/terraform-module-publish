@@ -28,6 +28,7 @@ consumers alike.
 | `commit-sha` | `""` | commit associated with the new HCP version |
 | `wait-for-publish` | `false` | wait until the version is available/ready |
 | `timeout-seconds` | `180` | wait timeout |
+| `registry-allowed-hosts` | `""` | hosts the registry requests may reach (see [Registry egress](#registry-egress)) |
 
 ## Outputs
 
@@ -35,6 +36,41 @@ consumers alike.
 |--------|-------|
 | `published` | `"true"` if published / sync triggered, `"false"` if it already existed |
 | `message` | human-readable status |
+
+## Registry egress
+
+`registry-url` and `hcp-address` are operator-supplied and every request carries
+the registry `Authorization: Bearer` credential, so the destination is
+authorized before the request is issued **and again on every redirect hop** — a
+hop re-sends the same credential, so it is exactly as sensitive as the first
+destination.
+
+- **`registry-allowed-hosts` empty (default).** Any public host is permitted,
+  including the default `app.terraform.io`. A destination that *is* — or that
+  *resolves to* — a private, link-local, carrier-grade-NAT or otherwise
+  reserved address is refused, including the cloud instance-metadata service at
+  `169.254.169.254`. The classification is numeric, so `127.1`, `2130706433`,
+  `0x7f000001`, `017700000001` and `[::ffff:127.0.0.1]` are all recognised as
+  loopback.
+- **`registry-allowed-hosts` set.** Only the listed hosts are permitted, on
+  every hop — which is how a deliberately-private, self-hosted registry stays
+  reachable. Entries are comma/newline-separated hostnames, IP literals, or
+  single-label wildcards (`*.registry.example.com` covers
+  `modules.registry.example.com` but not `a.modules.registry.example.com`). An
+  entry that cannot mean what you intended (`*.com`, a trailing `*`, an
+  embedded port) fails the step rather than degrading to a weaker allowlist.
+
+The initial URL is authorized on its hostname, so
+`https://registry.example.com:8443/` works under a `registry.example.com` pin; a
+*redirect* onto a non-default port is refused, so a pin cannot be widened to
+another port on the same host.
+
+Only `https://` URLs are accepted, and each request is bounded by a 60s timeout.
+
+The host-authorization primitives come from
+[`@4cloudguru/pipeline-task-core`](https://www.npmjs.com/package/@4cloudguru/pipeline-task-core),
+shared with the Azure Pipelines task extensions, so this action and they cannot
+drift apart.
 
 ## Examples
 

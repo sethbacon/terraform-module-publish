@@ -1,4 +1,5 @@
 import * as core from '@actions/core'
+import { createHostAuthorizer } from './egress'
 import { createHttpsClient } from './http'
 import { RegistryPublisher, RegistryType } from './types'
 import { PrivateRegistryPublisher } from './private-publisher'
@@ -25,12 +26,15 @@ function buildPublisher(): RegistryPublisher {
   }
   const waitForPublish = core.getBooleanInput('wait-for-publish')
   const timeoutSeconds = parseTimeout()
+  // One egress decision for the run, applied by the client to the initial URL
+  // and to every redirect hop of every request it makes.
+  const authorizeHost = createHostAuthorizer(core.getInput('registry-allowed-hosts'))
 
   if (registryType === 'private') {
     const apiKey = required('api-key')
     core.setSecret(apiKey)
     const skipTlsVerify = core.getBooleanInput('skip-tls-verify')
-    return new PrivateRegistryPublisher(createHttpsClient(!skipTlsVerify), {
+    return new PrivateRegistryPublisher(createHttpsClient(!skipTlsVerify, authorizeHost), {
       ...coordinates,
       registryUrl: required('registry-url'),
       apiKey,
@@ -42,7 +46,7 @@ function buildPublisher(): RegistryPublisher {
   if (registryType === 'hcp') {
     const token = required('hcp-token')
     core.setSecret(token)
-    return new HcpPublisher(createHttpsClient(true), {
+    return new HcpPublisher(createHttpsClient(true, authorizeHost), {
       ...coordinates,
       address: core.getInput('hcp-address') || 'https://app.terraform.io',
       token,
