@@ -15,6 +15,46 @@ export type HttpClient = (
     body?: string,
 ) => Promise<HttpResponse>;
 
+/** Optional per-run tuning for {@link createHttpsClient}. */
+export interface HttpsClientOptions {
+    /**
+     * PEM trust anchor(s) for a registry fronted by a private CA. Supplying one
+     * REPLACES the default trust store for this client's requests, which is the
+     * tighter choice: a publicly-trusted CA cannot then mint a certificate for
+     * an internal registry name and be believed.
+     */
+    caCert?: string;
+    /** `fetch` implementation, injectable so tests need no network. */
+    fetchImpl?: typeof fetch;
+}
+
+/** Refusal text for the withdrawn `skip-tls-verify` input; names the replacement. */
+export const SKIP_TLS_VERIFY_REMOVED =
+    "The 'skip-tls-verify' input has been removed because it disabled certificate AND hostname " +
+    'verification on the very requests that carry the registry API key as a Bearer credential, so any ' +
+    'host that answered for the registry name harvested it. For a registry fronted by a private CA, ' +
+    "supply that CA's certificate (PEM) as the 'ca-cert' input instead — verification stays on and the " +
+    "private CA is trusted. Remove 'skip-tls-verify' from the step.";
+
+/**
+ * Turns the action's TLS inputs into the client's trust configuration, refusing
+ * the withdrawn verification-off switch.
+ *
+ * Read as raw text rather than through `getBooleanInput` so that every spelling
+ * an operator might reach for (`true`, `TRUE`, `yes`, `1`) hits the explanatory
+ * refusal instead of a schema `TypeError` that says nothing about why. Only an
+ * absent or explicitly-false value is treated as "not requested"; anything else
+ * fails the step rather than being quietly ignored.
+ */
+export function resolveTlsTrust(rawSkipTlsVerify: string, rawCaCert: string): HttpsClientOptions {
+    const skip = rawSkipTlsVerify.trim().toLowerCase();
+    if (skip !== '' && skip !== 'false' && skip !== '0' && skip !== 'no') {
+        throw new Error(SKIP_TLS_VERIFY_REMOVED);
+    }
+    const caCert = rawCaCert.trim();
+    return caCert ? { caCert } : {};
+}
+
 /**
  * Creates an HTTPS client on top of the shared `@4cloudguru/pipeline-task-core`
  * client rather than a local copy of one. The hand-copied `https.request`
@@ -28,21 +68,23 @@ export type HttpClient = (
  * the registry bearer credential, so a hop is exactly as sensitive as the first
  * destination.
  *
- * @param rejectUnauthorized when false, TLS certificate validation is disabled
- *        (only appropriate for internal registries fronted by a private CA the
- *        runner does not trust).
+ * TLS peer verification is not optional here and there is deliberately no
+ * switch to turn it off: the first request already carries
+ * `Authorization: Bearer <api-key>`, so an unverified peer is a peer that
+ * harvests the credential. A private CA is accommodated by ADDING its
+ * certificate as a trust anchor (`caCert`), which keeps both chain and
+ * hostname verification — the two checks that the withdrawn verification-off
+ * switch dropped together.
+ *
  * @param authorizeHost the egress-authorization decision from `./egress`.
- * @param fetchImpl `fetch` implementation, injectable so tests need no network.
+ * @param options trust anchor and test seams; see {@link HttpsClientOptions}.
  */
-export function createHttpsClient(
-    rejectUnauthorized: boolean,
-    authorizeHost: AuthorizeHost,
-    fetchImpl?: typeof fetch,
-): HttpClient {
+export function createHttpsClient(authorizeHost: AuthorizeHost, options: HttpsClientOptions = {}): HttpClient {
+    const { caCert, fetchImpl } = options;
     // One dispatcher for the client's lifetime, built only when the operator
-    // opted out of TLS verification; Node's fetch has no other way to reach
-    // that socket option.
-    const dispatcher = rejectUnauthorized ? undefined : new Agent({ connect: { rejectUnauthorized: false } });
+    // supplied a trust anchor; Node's fetch has no other way to reach that
+    // socket option.
+    const dispatcher = caCert ? new Agent({ connect: { ca: caCert } }) : undefined;
 
     return async (method, url, headers, body) => {
         const client = createHttpClient({
@@ -73,6 +115,28 @@ export function createHttpsClient(
             body: await response.text(),
         }));
     };
+}
+
+/**
+ * Flattens an error and its `cause` chain into a single line.
+ *
+ * `fetch` reports a refused handshake as a bare "fetch failed" and keeps the
+ * reason one level down, so the unflattened message tells an operator nothing.
+ * Which reason it is decides what they do next: an untrusted private CA
+ * (`DEPTH_ZERO_SELF_SIGNED_CERT`, `UNABLE_TO_VERIFY_LEAF_SIGNATURE`) means
+ * `ca-cert` is missing or wrong, while a hostname mismatch
+ * (`ERR_TLS_CERT_ALTNAME_INVALID`) means the certificate does not name the host
+ * they pointed at.
+ */
+export function describeError(error: unknown): string {
+    const parts: string[] = [];
+    let current: unknown = error;
+    for (let depth = 0; current instanceof Error && depth < 5; depth++) {
+        const { code } = current as NodeJS.ErrnoException;
+        parts.push(code ? `${current.message} (${code})` : current.message);
+        current = (current as { cause?: unknown }).cause;
+    }
+    return parts.length > 0 ? parts.join(': ') : String(error);
 }
 
 /** Parses a JSON response body into the requested shape. */

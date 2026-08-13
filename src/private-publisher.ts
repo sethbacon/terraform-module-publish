@@ -1,3 +1,4 @@
+import { validateUrlPathSegment } from '@4cloudguru/pipeline-task-core';
 import { HttpClient, parseJson, delay } from './http';
 import { ModuleCoordinates, PublishResult, RegistryPublisher } from './types';
 
@@ -29,8 +30,23 @@ export function moduleUrl(base: string, c: ModuleCoordinates): string {
     );
 }
 
+/**
+ * Builds the admin tag-sync URL for a module id the REGISTRY supplied.
+ *
+ * Unlike the coordinates in {@link moduleUrl}, `moduleId` is not an author
+ * input: it is read out of the registry's own JSON response and then lands in
+ * the path of an authenticated admin POST carrying the same Bearer key. It is
+ * REJECTED rather than encoded. The registry mints module ids as UUIDs, so a
+ * value needing escaping is not an id it issues — encoding would defuse the
+ * traversal but still send the credentialed admin request at a compromised
+ * registry's direction, and would hide that the peer misbehaved. The shared
+ * validator refuses `..` as well as every path-, query- and fragment-meaningful
+ * character, so `a/../b`, `%2e%2e%2f`, `1?owner=2#` and whitespace all fail
+ * before a request is issued.
+ */
 export function syncUrl(base: string, moduleId: string): string {
-    return `${trimTrailingSlash(base)}/api/v1/admin/modules/${moduleId}/scm/sync`;
+    const id = validateUrlPathSegment('The module id in the registry response', moduleId);
+    return `${trimTrailingSlash(base)}/api/v1/admin/modules/${id}/scm/sync`;
 }
 
 export function hasVersion(body: string, version: string): boolean {

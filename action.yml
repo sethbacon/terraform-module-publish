@@ -30,8 +30,19 @@ inputs:
     description: API key for the private registry (Bearer). Required for registry-type=private.
     required: false
     default: ""
+  ca-cert:
+    description: >-
+      PEM certificate(s) for the CA that issued the registry's TLS certificate,
+      for a registry fronted by a private CA. Trusting the CA keeps both
+      certificate-chain and hostname verification on. When set, it replaces the
+      default trust store for the action's registry requests.
+    required: false
+    default: ""
   skip-tls-verify:
-    description: Disable TLS verification for the private registry (private-CA endpoints only).
+    description: >-
+      REMOVED. This disabled certificate AND hostname verification on requests
+      carrying the registry API key, so setting it now fails the step. Use
+      `ca-cert` instead.
     required: false
     default: "false"
   # --- HCP / TFE ---
@@ -48,9 +59,14 @@ inputs:
     required: false
     default: ""
   vcs-branch:
-    description: VCS branch for a VCS-connected HCP module.
+    description: >-
+      VCS branch for a VCS-connected HCP module. Leave empty (the default) to
+      create a TAG-based module, whose versions HCP imports from pushed git
+      tags. Setting a branch creates a branch-based module, whose versions stay
+      'pending' until a module archive is uploaded — which this action does not
+      do, and which now fails the step rather than reporting a publish.
     required: false
-    default: main
+    default: ""
   vcs-oauth-token-id:
     description: HCP VCS OAuth token ID used to create the module if missing.
     required: false

@@ -22,9 +22,29 @@ interface HcpModuleResponse {
     data?: {
         attributes?: {
             'version-statuses'?: VersionStatus[];
+            'vcs-repo'?: { branch?: string } | null;
         };
     };
 }
+
+interface HcpVersionResponse {
+    data?: {
+        links?: { upload?: string };
+    };
+}
+
+/**
+ * How a module's versions come into being, which decides whether this action
+ * can complete a publish at all.
+ *
+ * HCP's registry-modules API splits modules in two: a VCS module linked to a
+ * branch, and a module with no VCS repo, both take versions from
+ * `POST .../versions` followed by a PUT of a gzipped module archive to the
+ * `links.upload` URL the response returns — the version sits at status
+ * `pending` until that upload lands. A VCS module linked by TAG takes its
+ * versions from pushed git tags automatically and never uses that endpoint.
+ */
+export type PublishMode = 'tag-based' | 'upload-driven';
 
 type HcpModuleRef = ModuleCoordinates & { address: string };
 
@@ -50,17 +70,56 @@ export function versionStatus(body: string, version: string): string | undefined
     return statuses.find((s) => s.version === version)?.status;
 }
 
+/**
+ * Reads a module's publish mode off the registry's own description of it,
+ * rather than guessing from the action's inputs.
+ *
+ * A `vcs-repo` with a branch is branch-based and an absent `vcs-repo` is a
+ * no-VCS module; both take content by upload. A `vcs-repo` without a branch is
+ * tag-based, and HCP fills its versions in from pushed tags.
+ */
+export function publishMode(body: string): PublishMode {
+    const vcsRepo = parseJson<HcpModuleResponse>(body).data?.attributes?.['vcs-repo'];
+    return vcsRepo && !vcsRepo.branch ? 'tag-based' : 'upload-driven';
+}
+
+/**
+ * True when HCP answered a version creation with an archive-upload URL, which
+ * is HCP stating that the version it just created is `pending` and stays that
+ * way until module content is PUT to that URL.
+ */
+export function requiresContentUpload(body: string): boolean {
+    try {
+        return Boolean(parseJson<HcpVersionResponse>(body).data?.links?.upload);
+    } catch {
+        // A body that is not JSON cannot be asserting an upload requirement.
+        return false;
+    }
+}
+
+/**
+ * Body for creating a VCS-connected module.
+ *
+ * `branch` is omitted entirely when no branch was requested, which is what
+ * makes the created module TAG-based: HCP then imports each pushed git tag as
+ * a version on its own. Sending `branch: ""` would instead create a
+ * branch-based module, whose versions need an archive upload this action does
+ * not perform.
+ */
 export function vcsModuleBody(o: HcpOptions): string {
+    const vcsRepo: Record<string, string> = {
+        identifier: o.vcsRepoIdentifier,
+        'display-identifier': o.vcsRepoIdentifier,
+        'oauth-token-id': o.vcsOauthTokenId,
+    };
+    if (o.vcsBranch) {
+        vcsRepo.branch = o.vcsBranch;
+    }
     return JSON.stringify({
         data: {
             type: 'registry-modules',
             attributes: {
-                'vcs-repo': {
-                    identifier: o.vcsRepoIdentifier,
-                    'display-identifier': o.vcsRepoIdentifier,
-                    'oauth-token-id': o.vcsOauthTokenId,
-                    branch: o.vcsBranch,
-                },
+                'vcs-repo': vcsRepo,
                 'no-code': false,
             },
         },
@@ -94,11 +153,13 @@ export class HcpPublisher implements RegistryPublisher {
             'Content-Type': 'application/vnd.api+json',
         };
 
+        let mode: PublishMode;
         const check = await this.http('GET', moduleUrl(o), headers);
         if (check.status >= 200 && check.status < 300) {
             if (versionStatus(check.body, o.version) === 'ok') {
                 return { published: false, message: `Version ${o.version} already exists and is ready.` };
             }
+            mode = publishMode(check.body);
         } else if (check.status === 404) {
             if (!o.vcsRepoIdentifier || !o.vcsOauthTokenId) {
                 throw new Error(
@@ -110,15 +171,64 @@ export class HcpPublisher implements RegistryPublisher {
             if (created.status < 200 || created.status >= 300) {
                 throw new Error(`Failed to create HCP module (HTTP ${created.status}): ${created.body}`);
             }
+            mode = o.vcsBranch ? 'upload-driven' : 'tag-based';
         } else {
-            this.log(`Could not check existing module (HTTP ${check.status}); attempting to publish version.`);
+            this.log(`Could not check existing module (HTTP ${check.status}); assuming the mode implied by vcs-branch.`);
+            mode = o.vcsBranch ? 'upload-driven' : 'tag-based';
         }
 
+        return mode === 'tag-based' ? this.publishTagBased(headers) : this.publishUploadDriven(headers);
+    }
+
+    /**
+     * Tag-based module: HCP imports the version from the git tag the workflow
+     * pushed, so there is nothing for this action to create — `POST
+     * .../versions` does not apply to this class of module — and nothing to
+     * upload. All that remains is to observe the import, if asked to.
+     */
+    private async publishTagBased(headers: Record<string, string>): Promise<PublishResult> {
+        const o = this.options;
+        if (!o.waitForPublish) {
+            return {
+                published: true,
+                message:
+                    `Module ${o.namespace}/${o.name}/${o.provider} is tag-based: HCP Terraform imports version ` +
+                    `${o.version} from the pushed git tag. Not waiting for the import (wait-for-publish: false).`,
+            };
+        }
+        if (!(await this.waitForOk(headers))) {
+            throw new Error(
+                `Timed out after ${o.timeoutSeconds}s waiting for HCP Terraform to import version ${o.version} ` +
+                    'from the pushed git tag.',
+            );
+        }
+        return { published: true, message: `Version ${o.version} is ready in HCP Terraform.` };
+    }
+
+    /**
+     * Branch-based or no-VCS module: the version is created through the API and
+     * stays at status `pending` until a gzipped module archive is uploaded.
+     * This action has no module content to send, so a version HCP reports as
+     * upload-pending fails the step instead of being announced as published.
+     */
+    private async publishUploadDriven(headers: Record<string, string>): Promise<PublishResult> {
+        const o = this.options;
         const versionResp = await this.http('POST', versionsUrl(o), headers, versionBody(o.version, o.commitSha));
         if (versionResp.status === 422) {
             this.log(`Version ${o.version} already exists.`);
         } else if (versionResp.status < 200 || versionResp.status >= 300) {
             throw new Error(`Failed to create version (HTTP ${versionResp.status}): ${versionResp.body}`);
+        } else if (requiresContentUpload(versionResp.body)) {
+            // The upload URL HCP returned is deliberately NOT echoed: it is a
+            // bearer capability to write that object, and step logs are not the
+            // place for one.
+            throw new Error(
+                `Version ${o.version} was created but HCP Terraform holds it at status 'pending' until a module ` +
+                    'archive is uploaded, and this action does not upload module content. Publish tag-based ' +
+                    "instead by leaving 'vcs-branch' empty, so HCP imports the version from the pushed git tag; " +
+                    'or upload the archive yourself using the upload URL from the versions API. See the HCP ' +
+                    'section of the action README.',
+            );
         } else {
             this.log(`Version ${o.version} created.`);
         }

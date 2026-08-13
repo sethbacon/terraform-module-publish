@@ -109,7 +109,7 @@ const redirectTo = (location: string) => (): Response =>
 
 describe('registry client authorizes the initial URL and every redirect hop', () => {
   const get = (url: string, allowedHosts: string, fetchImpl: typeof fetch) =>
-    createHttpsClient(true, createHostAuthorizer(allowedHosts, publicDns), fetchImpl)('GET', url, {
+    createHttpsClient(createHostAuthorizer(allowedHosts, publicDns), { fetchImpl })('GET', url, {
       Authorization: 'Bearer secret',
     })
 
@@ -160,7 +160,7 @@ describe('registry client authorizes the initial URL and every redirect hop', ()
     // The publishers poll the same client repeatedly (waitForPublish); the
     // decision must be re-applied per call, not cached at construction.
     const { fetch: impl, urls } = recordingFetch([ok, ok])
-    const client = createHttpsClient(true, createHostAuthorizer('', publicDns), impl)
+    const client = createHttpsClient(createHostAuthorizer('', publicDns), { fetchImpl: impl })
     await expect(client('GET', 'https://registry.example.com/a', {})).resolves.toMatchObject({ status: 200 })
     await expect(client('GET', 'https://169.254.169.254/b', {})).rejects.toThrow('private')
     expect(urls).toEqual(['https://registry.example.com/a'])
