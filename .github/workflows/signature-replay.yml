@@ -1,0 +1,306 @@
+# Signature replay — the PER-REPO, merge-blocking half of the gate.
+#
+# WHY THIS REPO HOSTS IT. Two signatures read this repo: `action-egress-
+# authorization` (ledger #10 — no egress host authorization, so a consumer's
+# bearer credential is delivered to a host nothing authorized) and
+# `action-peer-trust` (ledger #9 — TLS verification disabled on a credentialed
+# request, and a response-derived value trusted to build the next one). Both are
+# recorded against this action and terraform-drift-report together. A signature
+# can only block a merge in the repo where the merge happens, and for this repo
+# that is here.
+#
+# Check 2 reads this repo as well, and would even if no signature matched: it
+# consumes @4cloudguru/pipeline-task-core, and a fix shipped there is not shown
+# to have reached this consumer until the pin here moves past it.
+#
+# COST OF THIS FORM, decide before installing: the ledger and signatures live in
+# the PRIVATE security-orchestration repo, so every host repo needs a credential
+# that can read it, and every other repo in the scope is public. Weigh that
+# against what it buys — this form BLOCKS a bad merge, which the central form
+# cannot.
+#
+# That credential is deliberately the smallest thing that closes the gap. Every
+# OTHER repo the replay reads is public, so its checkout takes the job's own
+# GITHUB_TOKEN and no distributed secret at all, and so do the `gh` calls behind
+# --verify-linked-issues. The app token is used for ONE step: checking out
+# security-orchestration. It is read-only and expires in an hour.
+#
+# It is supplied by a `SUITE_READ_APP_ID` variable and a `SUITE_READ_APP_KEY`
+# secret ON THIS REPOSITORY. `sethbacon` is a personal account, which has no
+# account-level Actions secrets, so there is nothing for a repo to inherit and no
+# copy of these to fall back on — every host repo carries its own. Without them
+# the job stops at the token step and goes red; it does not quietly skip the
+# replay, which is the only acceptable behaviour for a gate.
+#
+# A fine-grained PAT was tried first and cannot work here. Its resource owner is
+# fixed at one account, so a token owned by one account can never read a repo
+# owned by an org no matter how it is configured, and an org may cap or forbid
+# PAT lifetimes outright. A GitHub App is installed per owner and mints a token
+# per installation, which is why this is an app and not a secret string.
+#
+# The central form (security-orchestration/.github/workflows/signature-replay.yml)
+# runs the same replay on a schedule from inside the private repo, cloning the
+# public suite repos with the default token and needing NO distributed secret. It
+# catches a reopened class within a day but cannot stop the PR that caused it.
+# Running both is the intended end state.
+#
+# Adding this file is NOT enforcement. See "Wiring it up" in
+# remediation/replay/README.md: the check must also be added to the branch's
+# required_status_checks, under the context `replay` — GitHub names an Actions
+# check run for the JOB alone — and that state must be asserted against the live
+# API rather than read off this YAML. Registry-backend issue #563 is a
+# closed-then-regressed finding whose entire content is that security scans ran
+# but did not block merge.
+#
+name: signature-replay
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Check 2, and the "new instance written since the fix" case, depend on time
+  # passing rather than on anyone opening a PR.
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: signature-replay-${ github.ref }
+  cancel-in-progress: true
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      # Every repo in SIGNATURE_SCOPE must be present. A signature that cannot
+      # run against a repo establishes nothing about it, and the job exits 2
+      # rather than pretending otherwise — so these checkouts are load-bearing,
+      # not convenience. scope.json's `dir` is what `--repos-root suite` resolves
+      # against, so each `path` basename below is a contract with that file.
+      #
+      # All of them are PUBLIC, so none takes a `token:` — actions/checkout falls
+      # back to the job's own GITHUB_TOKEN, which reads public repositories
+      # anywhere. Handing these a credential-to-a-private-repo bought nothing and
+      # put it in more places.
+      #
+      # persist-credentials: false on EVERY checkout, the tokenless ones included.
+      # Without it, actions/checkout leaves whatever credential it used in that
+      # clone's .git/config, inside a job that also uploads an artifact. That is
+      # zizmor's `artipacked` audit, and it is not theoretical: widen the upload
+      # path by one glob and the credential ships with the report. The replay only
+      # READS these trees; nothing after the checkouts needs git credentials.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          {
+            persist-credentials: false,
+            repository: sethbacon/terraform-registry-backend,
+            path: suite/terraform-registry-backend,
+          }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          {
+            persist-credentials: false,
+            repository: sethbacon/terraform-state-manager-backend,
+            path: suite/terraform-state-manager-backend,
+          }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          {
+            persist-credentials: false,
+            repository: sethbacon/terraform-registry-frontend,
+            path: suite/terraform-registry-frontend,
+          }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          {
+            persist-credentials: false,
+            repository: sethbacon/terraform-state-manager-frontend,
+            path: suite/terraform-state-manager-frontend,
+          }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          {
+            persist-credentials: false,
+            repository: sethbacon/terraform-suite-identity,
+            path: suite/terraform-suite-identity,
+          }
+      # `path` is the OLD name on purpose: scope.json's `dir` is what
+      # `--repos-root suite` resolves against, and renaming the repo did not
+      # rename the scope entry.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          {
+            persist-credentials: false,
+            repository: 4cloudguru/cloud-suite-ui,
+            path: suite/terraform-suite-ui,
+          }
+      # The two ADO extensions are siblings that COPY modules between each other
+      # rather than sharing a versioned one, so a class found in either is
+      # presumed in the other and every signature runs in both.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          {
+            persist-credentials: false,
+            repository: sethbacon/azure-pipelines-packer,
+            path: suite/azure-pipelines-packer,
+          }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          {
+            persist-credentials: false,
+            repository: sethbacon/azure-pipelines-terraform,
+            path: suite/azure-pipelines-terraform,
+          }
+      # The shared module the extensions and two of the actions consume. No
+      # signature applies to it yet (nothing declares the `npm` kind), but code
+      # that leaves an audited repo arrives HERE, and a version pin only beats
+      # copy-paste if something reads it — which check 2 cannot do for a repo
+      # that is not checked out.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          {
+            persist-credentials: false,
+            repository: 4cloudguru/pipeline-task-core,
+            path: suite/pipeline-task-core,
+          }
+
+      # The GitHub-Actions family: two composite actions whose whole
+      # implementation is shell in action.yml, two node actions, and the drift
+      # payload contract they and the ADO TerraformDriftReport task share. Same
+      # rule as every checkout above — in scope.json and absent here is exit 2 for
+      # the whole job, not a quieter run. Note the OWNER: drift-contract is in the
+      # 4cloudguru org, not sethbacon. Both orgs' repos are public, so the job's
+      # own GITHUB_TOKEN still reads them, but the slug is not interchangeable.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          {
+            persist-credentials: false,
+            repository: sethbacon/setup-terraform-hardened,
+            path: suite/setup-terraform-hardened,
+          }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          {
+            persist-credentials: false,
+            repository: sethbacon/terraform-provider-mirror,
+            path: suite/terraform-provider-mirror,
+          }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          {
+            persist-credentials: false,
+            repository: sethbacon/terraform-drift-report,
+            path: suite/terraform-drift-report,
+          }
+      # THIS REPO. The self-overwrite step below replaces this checkout with the
+      # commit under test on a pull_request, so the replay reads the PR's code
+      # rather than origin/main's — which is the whole reason this copy blocks a
+      # merge and the scheduled central run cannot.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          {
+            persist-credentials: false,
+            repository: sethbacon/terraform-module-publish,
+            path: suite/terraform-module-publish,
+          }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          {
+            persist-credentials: false,
+            repository: 4cloudguru/terraform-drift-contract,
+            path: suite/terraform-drift-contract,
+          }
+
+      # Overwrite this repo's sibling copy with the commit under test, so the
+      # replay reads the PR's code and not origin/main's. Guarded because
+      # `github.event.repository` is absent on schedule events — the path would
+      # collapse to `suite/` and dump this repo into the suite root. A scheduled
+      # run wants origin/main anyway, which the explicit checkout above already
+      # fetched.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name != 'schedule'
+        with:
+          persist-credentials: false
+          clean: false
+          path: suite/${{ github.event.repository.name }}
+
+      # The one private repo, and so the one credential. `owner:` is load-bearing
+      # rather than cosmetic: an app token is minted per INSTALLATION, and the
+      # default — the running repo's owner — mints nothing useful from a repo in
+      # another org, so every copy of this file names the owner explicitly.
+      # `repositories:` narrows the minted token to the single repo it is spent
+      # on, and `permission-contents: read` narrows what it may do there: without
+      # it the token inherits every permission the app installation holds, which
+      # is zizmor's `github-app-token` audit and is how a read-only intention
+      # becomes a write-capable credential the day someone widens the app.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: suite-read
+        with:
+          app-id: "${{ vars.SUITE_READ_APP_ID }}"
+          private-key: "${{ secrets.SUITE_READ_APP_KEY }}"
+          owner: sethbacon
+          repositories: security-orchestration
+          permission-contents: read
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: sethbacon/security-orchestration
+          token: "${{ steps.suite-read.outputs.token }}"
+          path: security-orchestration
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # The credential-lifecycle signature is a type-aware Go analyzer; the
+      # replay invokes it with `go run` from its own module directory.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: security-orchestration/remediation/signatures/credlifecycle/go.mod
+          cache-dependency-path: security-orchestration/remediation/signatures/credlifecycle/go.sum
+
+      # Every ado-extension signature is node: premask-emission.cjs and
+      # output-boundary.cjs are node analysers, and the other six shell out to
+      # each extension's OWN committed gate so the replay and that repo's CI
+      # cannot answer differently about the same code. `rg` and `ast-grep` are
+      # deliberately unused: neither exists in a non-interactive shell here and
+      # both exit 127, which reads as "no matches".
+      #
+      # The four GitHub-Actions-family signatures add no runtime of their own:
+      # they are Python, and action-artifact-trust parses action.yml with a
+      # block-YAML subset reader rather than importing PyYAML, which
+      # actions/setup-python does not provide and whose absence would exit 2 in
+      # exactly this job.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+
+      # --verify-linked-issues: a CLOSED linked issue stops absorbing residual.
+      # Every issue the ledger links to is in a PUBLIC repo, which GITHUB_TOKEN
+      # reads without help; the app token is not needed here and is not given.
+      # Link an issue in a private repo and this fails loudly as a GATE ERROR
+      # rather than assuming open — at which point widen the credential, not the
+      # assumption.
+      - name: Replay recorded signatures
+        env:
+          GH_TOKEN: "${{ github.token }}"
+        run: |
+          python security-orchestration/remediation/replay/replay.py \
+            --ledger security-orchestration/remediation/signatures/ledger.json \
+            --repos-root suite \
+            --verify-linked-issues \
+            --json replay-report.json
+
+      # Exit 1 or 2 already failed the step above; this keeps the machine-readable
+      # report for the run someone will actually want to read.
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signature-replay-report
+          path: replay-report.json
+          if-no-files-found: warn
