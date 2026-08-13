@@ -68,6 +68,16 @@ inputs:
     description: Wait timeout in seconds (when wait-for-publish is true).
     required: false
     default: "180"
+  registry-allowed-hosts:
+    description: >-
+      Comma/newline-separated hosts the registry-url / hcp-address requests may
+      reach, applied to the initial URL and to every redirect hop. A `*.` prefix
+      matches exactly one label (`*.registry.example.com`). When set, only these
+      hosts are permitted — which is how a deliberately-private, self-hosted
+      registry stays reachable. When empty, any public host is permitted and
+      private, link-local or otherwise reserved destinations are refused.
+    required: false
+    default: ""
 
 outputs:
   published:

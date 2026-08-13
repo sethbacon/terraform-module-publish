@@ -10,7 +10,9 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "@actions/core": "^1.11.1"
+    "@4cloudguru/pipeline-task-core": "0.2.0",
+    "@actions/core": "^1.11.1",
+    "undici": "^6.28.0"
   },
   "overrides": {
     "undici": "^6.28.0"
