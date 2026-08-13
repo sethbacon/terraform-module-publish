@@ -10,13 +10,23 @@ on:
       - synchronize
       - reopened
 
+# Floor. A job that declares no `permissions:` of its own inherits THIS rather
+# than the repository default, which is read/write on any repo never switched
+# over to the restricted default.
+permissions:
+  contents: read
+
 jobs:
   conventional-title:
     name: Conventional PR Title
     runs-on: ubuntu-latest
+    # Reading a pull request title is all this needs; the token is handed to a
+    # third-party action below, so it is scoped to exactly that.
+    permissions:
+      pull-requests: read
     steps:
       - name: Check PR title follows Conventional Commits
-        uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v5.5.3
+        uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -52,5 +62,5 @@ jobs:
       - name: Dependency Review
         uses: actions/dependency-review-action@da24556b548a50705dd671f47852072ea4c105d9 # v4
         with:
-          fail-on-severity: high
+          fail-on-severity: moderate
           comment-summary-in-pr: on-failure

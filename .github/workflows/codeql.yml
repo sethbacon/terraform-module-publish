@@ -1,0 +1,50 @@
+---
+name: CodeQL
+
+# `tsc --noEmit` is a type check, not a security analysis. None of the
+# taint-shaped properties in this action — a remote response body flowing into a
+# URL path, unvalidated JSON, a URL built from an operator input, a bearer
+# credential reaching a log — had any automated detector before this.
+#
+# The schedule matters as much as the PR trigger: dependency-review only
+# evaluates dependencies a PR *changes*, so it is silent about an advisory
+# published tomorrow against something already pinned in the lockfile and
+# already inlined into dist/index.js.
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "27 4 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze javascript-typescript
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
+        with:
+          languages: javascript-typescript
+          # security-extended picks up the injection and SSRF queries that the
+          # default suite leaves out, which is the whole reason this is here.
+          queries: security-extended
+
+      - uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
+        with:
+          category: /language:javascript-typescript
