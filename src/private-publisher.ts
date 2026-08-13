@@ -1,5 +1,5 @@
 import { validateUrlPathSegment } from '@4cloudguru/pipeline-task-core';
-import { HttpClient, parseJson, delay } from './http';
+import { HttpClient, bodyExcerpt, parseJson, delay } from './http';
 import { ModuleCoordinates, PublishResult, RegistryPublisher } from './types';
 
 /** Inputs for publishing to a private registry (terraform-registry-backend). */
@@ -50,8 +50,8 @@ export function syncUrl(base: string, moduleId: string): string {
 }
 
 export function hasVersion(body: string, version: string): boolean {
-    const parsed = parseJson<ModuleResponse>(body);
-    return Array.isArray(parsed.versions) && parsed.versions.some((v) => v.version === version);
+    const parsed = parseJson<ModuleResponse>(body, 'The registry module response');
+    return Array.isArray(parsed.versions) && parsed.versions.some((v) => v?.version === version);
 }
 
 /**
@@ -63,6 +63,13 @@ export class PrivateRegistryPublisher implements RegistryPublisher {
         private readonly http: HttpClient,
         private readonly options: PrivateRegistryOptions,
         private readonly log: (message: string) => void = console.log,
+        /**
+         * Diagnostic channel for the FULL response body of a failed request.
+         * Wired to `core.debug`, so it is suppressed unless the consumer sets
+         * `ACTIONS_STEP_DEBUG` — the always-visible annotation gets only the
+         * bounded, control-character-stripped excerpt.
+         */
+        private readonly debug: (message: string) => void = () => {},
     ) {}
 
     async publish(): Promise<PublishResult> {
@@ -78,16 +85,22 @@ export class PrivateRegistryPublisher implements RegistryPublisher {
             );
         }
         if (moduleResp.status < 200 || moduleResp.status >= 300) {
-            throw new Error(`Failed to resolve module (HTTP ${moduleResp.status}): ${moduleResp.body}`);
+            this.debug(`Registry module-resolution response body: ${moduleResp.body}`);
+            throw new Error(
+                `Failed to resolve module (HTTP ${moduleResp.status}): ${bodyExcerpt(moduleResp.body)}`,
+            );
         }
-        const moduleId = parseJson<ModuleResponse>(moduleResp.body).id;
+        const moduleId = parseJson<ModuleResponse>(moduleResp.body, 'The registry module response').id;
         if (!moduleId) {
             throw new Error('Registry response did not include a module id.');
         }
 
         const syncResp = await this.http('POST', syncUrl(registryUrl, moduleId), authHeader);
         if (syncResp.status !== 202) {
-            throw new Error(`Failed to trigger sync (HTTP ${syncResp.status}): ${syncResp.body}`);
+            this.debug(`Registry sync-trigger response body: ${syncResp.body}`);
+            throw new Error(
+                `Failed to trigger sync (HTTP ${syncResp.status}): ${bodyExcerpt(syncResp.body)}`,
+            );
         }
         this.log(`Sync triggered for ${namespace}/${name}/${provider}.`);
 

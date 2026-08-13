@@ -72,7 +72,12 @@ inputs:
     required: false
     default: ""
   commit-sha:
-    description: Commit SHA to associate with the new HCP module version.
+    description: >-
+      Commit SHA recorded on the new HCP module version. Left empty (the
+      default) it falls back to the runner's GITHUB_SHA — the commit the
+      workflow ran on — so the registry's version record is tied to a commit
+      without the workflow having to set anything. Set it only when the version
+      genuinely comes from a different commit.
     required: false
     default: ""
   # --- common ---

@@ -112,12 +112,25 @@ function runAction(extraEnv) {
   })
 }
 
-/** A TLS registry that records every request before answering it. */
+/**
+ * A TLS registry that records every request before answering it.
+ *
+ * The BODY is recorded too, because "the version was created carrying the
+ * commit the workflow ran on" is a claim about what was sent, and the only
+ * honest place to check it is the peer's own view of the request.
+ */
 function startRegistry(respond) {
   const requests = []
   const server = createServer(TLS, (req, res) => {
-    requests.push({ method: req.method, path: req.url, auth: req.headers.authorization ?? '' })
-    respond(req, res)
+    const record = {
+      method: req.method,
+      path: req.url,
+      auth: req.headers.authorization ?? '',
+      body: '',
+    }
+    requests.push(record)
+    req.on('data', (d) => (record.body += d))
+    req.on('end', () => respond(req, res))
   })
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () =>
@@ -445,6 +458,238 @@ console.log('\n=== hcp: a tag-based module gets no version POST ===')
     '::add-mask:: is emitted for the hcp token',
     r.stdout.includes(`::add-mask::${HCP_TOKEN}`),
     r.stdout.split('\n').filter((l) => l.includes('add-mask')).join(' | ') || '(no mask line)',
+  )
+}
+
+// --------------------------------------------------------------------------
+// Masking is unconditional. The mask is job-scoped and cannot be applied
+// retroactively, so what matters is that it is registered on paths that FAIL
+// before the credential is ever consumed — which is where it used to be
+// skipped entirely. Each row supplies a credential and then throws early.
+// --------------------------------------------------------------------------
+console.log('\n=== both credentials are masked before anything else can throw ===')
+for (const [what, env, expect] of [
+  [
+    'the withdrawn skip-tls-verify refusal, which throws before the branch',
+    { 'INPUT_SKIP-TLS-VERIFY': 'true', 'INPUT_REGISTRY-URL': 'https://registry.example.com' },
+    [API_KEY],
+  ],
+  [
+    'an unsupported registry-type, which matches no credential branch at all',
+    {
+      'INPUT_REGISTRY-TYPE': 'Private',
+      'INPUT_HCP-TOKEN': HCP_TOKEN,
+      'INPUT_REGISTRY-URL': 'https://registry.example.com',
+    },
+    [API_KEY, HCP_TOKEN],
+  ],
+  [
+    'a missing required coordinate, which throws before the branch',
+    { 'INPUT_VERSION': '', 'INPUT_HCP-TOKEN': HCP_TOKEN },
+    [API_KEY, HCP_TOKEN],
+  ],
+  [
+    'the credential the chosen branch does NOT consume',
+    { 'INPUT_HCP-TOKEN': HCP_TOKEN, 'INPUT_REGISTRY-URL': 'https://169.254.169.254/' },
+    [API_KEY, HCP_TOKEN],
+  ],
+]) {
+  const r = await runAction(env)
+  check(
+    `${what}: masked anyway`,
+    r.code !== 0 && expect.every((secret) => r.stdout.includes(`::add-mask::${secret}`)),
+    `exit ${r.code}; masks: ${
+      r.stdout.split('\n').filter((l) => l.startsWith('::add-mask::')).join(' | ') || '(none)'
+    }; ${errorLine(r)}`,
+  )
+}
+
+// --------------------------------------------------------------------------
+// A failure body is the PEER's text, and core.setFailed's own escaping covers
+// only %, CR and LF. Without a bound the registry picks the length of the
+// consumer's annotation and every other control character in it.
+// --------------------------------------------------------------------------
+console.log('\n=== a hostile failure body cannot choose the size of the annotation ===')
+{
+  const hostile = `[31m${'A'.repeat(200_000)}`
+  const reg = await startRegistry((req, res) => {
+    res.writeHead(500, { 'content-type': 'application/json' })
+    res.end(hostile)
+  })
+  const r = await runAction({
+    'INPUT_REGISTRY-URL': reg.url,
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': '127.0.0.1',
+  })
+  await reg.close()
+  const line = errorLine(r)
+  check(
+    'the annotation is truncated, stripped, and still names the status',
+    r.code !== 0 &&
+      line.length < 900 &&
+      line.includes('HTTP 500') &&
+      /more characters truncated/.test(line) &&
+      // eslint-disable-next-line no-control-regex
+      !/[ --]/.test(line),
+    `${line.length} chars: ${line.slice(0, 200)}`,
+  )
+}
+
+// --------------------------------------------------------------------------
+// The body is bounded on the way IN as well. The wait loops re-issue the same
+// request every three seconds, so an unbounded read is pressure that repeats.
+// --------------------------------------------------------------------------
+console.log('\n=== an oversized response is cut off rather than absorbed ===')
+{
+  let written = 0
+  const chunk = Buffer.alloc(256 * 1024, 0x41)
+  const reg = await startRegistry((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    const pump = () => {
+      // Stop well past the client's 10 MB cap; if the cap is gone this keeps
+      // feeding the process instead.
+      while (written < 40 * 1024 * 1024) {
+        written += chunk.length
+        if (!res.write(chunk)) return res.once('drain', pump)
+      }
+      res.end()
+    }
+    pump()
+  })
+  const r = await runAction({
+    'INPUT_REGISTRY-URL': reg.url,
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': '127.0.0.1',
+  })
+  await reg.close()
+  check(
+    'the action refuses the oversized body and names the limit',
+    r.code !== 0 && /exceeded \d+ bytes/.test(errorLine(r)),
+    `exit ${r.code}, ${(written / 1048576).toFixed(1)} MB offered: ${errorLine(r) || r.stderr.slice(0, 200)}`,
+  )
+  // Paired with the positive observation, per rule 2: the registry must have
+  // been reached AND have streamed something before the count is allowed to
+  // prove anything. `written < 24 MB` on its own is satisfied by a bundle that
+  // never connected, which is the exact false PASS this harness exists to
+  // catch.
+  check(
+    'the read started, then stopped near the cap instead of running to the end',
+    reg.requests.length === 1 && written > 0 && written < 24 * 1024 * 1024,
+    `${reg.requests.length} request(s), ${(written / 1048576).toFixed(1)} MB written before the client gave up`,
+  )
+}
+
+// --------------------------------------------------------------------------
+// A 2xx that is not JSON is what a WAF, a captive portal or a proxy
+// interstitial answers with. It used to surface as a bare SyntaxError carrying
+// none of the calling context.
+// --------------------------------------------------------------------------
+console.log('\n=== a non-JSON 2xx is reported as such, not as a raw SyntaxError ===')
+{
+  const reg = await startRegistry((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' })
+    res.end('<html><body>Access denied by policy</body></html>')
+  })
+  const r = await runAction({
+    'INPUT_REGISTRY-URL': reg.url,
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': '127.0.0.1',
+  })
+  await reg.close()
+  check(
+    'the failure names the response and shows the body, not "Unexpected token"',
+    r.code !== 0 &&
+      /was not valid JSON/.test(errorLine(r)) &&
+      errorLine(r).includes('Access denied by policy') &&
+      !/Unexpected token/.test(errorLine(r)),
+    errorLine(r) || '(no ::error:: on stdout)',
+  )
+}
+
+// --------------------------------------------------------------------------
+// A registry response is not a trusted shape. `?? []` substituted only for
+// null/undefined, so a truthy non-array reached `.find` and threw a TypeError
+// from inside the wait loop.
+// --------------------------------------------------------------------------
+console.log('\n=== a non-array version-statuses does not crash the HCP path ===')
+{
+  const reg = await startRegistry((req, res) =>
+    json(res, 200, {
+      data: { attributes: { 'vcs-repo': { identifier: 'acme/vpc' }, 'version-statuses': 'notarray' } },
+    }),
+  )
+  const r = await runAction({
+    'INPUT_REGISTRY-TYPE': 'hcp',
+    'INPUT_HCP-ADDRESS': reg.url,
+    'INPUT_HCP-TOKEN': HCP_TOKEN,
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': '127.0.0.1',
+  })
+  await reg.close()
+  check(
+    'it completes the tag-based publish instead of throwing a TypeError',
+    r.code === 0 && outputValue(r.output, 'published') === 'true' && !/is not a function/.test(r.stdout),
+    `exit ${r.code}: ${errorLine(r) || JSON.stringify(r.output)}`,
+  )
+}
+
+// --------------------------------------------------------------------------
+// Provenance: the version HCP records must be tied to the commit the workflow
+// ran on. The input is optional and both README examples left it empty, so
+// the default has to come from the runner's own GITHUB_SHA.
+// --------------------------------------------------------------------------
+console.log('\n=== the created HCP version carries the commit the workflow ran on ===')
+{
+  const SHA = '9f1c0de5b8a74e2d3c6b1a0f4e7d8c9b0a1b2c3d'
+  const reg = await startRegistry((req, res) =>
+    req.method === 'GET'
+      ? json(res, 200, { data: { attributes: { 'vcs-repo': { branch: 'main' } } } })
+      : json(res, 201, { data: {} }),
+  )
+  const r = await runAction({
+    'INPUT_REGISTRY-TYPE': 'hcp',
+    'INPUT_HCP-ADDRESS': reg.url,
+    'INPUT_HCP-TOKEN': HCP_TOKEN,
+    'INPUT_VCS-BRANCH': 'main',
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': '127.0.0.1',
+    GITHUB_SHA: SHA,
+  })
+  await reg.close()
+  const post = reg.requests.find((q) => q.method === 'POST')
+  check(
+    'commit-sha defaults to GITHUB_SHA in the version the registry is asked to create',
+    post !== undefined &&
+      JSON.parse(post.body || '{}').data?.attributes?.['commit-sha'] === SHA,
+    post ? post.body.slice(0, 300) : '(no POST was issued)',
+  )
+}
+
+console.log('\n=== an explicit commit-sha still wins over GITHUB_SHA ===')
+{
+  const EXPLICIT = '1111111111111111111111111111111111111111'
+  const reg = await startRegistry((req, res) =>
+    req.method === 'GET'
+      ? json(res, 200, { data: { attributes: { 'vcs-repo': { branch: 'main' } } } })
+      : json(res, 201, { data: {} }),
+  )
+  const r = await runAction({
+    'INPUT_REGISTRY-TYPE': 'hcp',
+    'INPUT_HCP-ADDRESS': reg.url,
+    'INPUT_HCP-TOKEN': HCP_TOKEN,
+    'INPUT_VCS-BRANCH': 'main',
+    'INPUT_COMMIT-SHA': EXPLICIT,
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': '127.0.0.1',
+    GITHUB_SHA: '9f1c0de5b8a74e2d3c6b1a0f4e7d8c9b0a1b2c3d',
+  })
+  await reg.close()
+  const post = reg.requests.find((q) => q.method === 'POST')
+  check(
+    'the operator-supplied sha is the one sent',
+    post !== undefined &&
+      JSON.parse(post.body || '{}').data?.attributes?.['commit-sha'] === EXPLICIT,
+    post ? post.body.slice(0, 300) : '(no POST was issued)',
   )
 }
 
