@@ -184,7 +184,14 @@ updating deliberately.
 Releases are cut by [`release.yml`](.github/workflows/release.yml), which
 against the tagged tree re-runs lint, tests, `npm audit` and — the point of the
 tag trigger — **the dist-sync check**, proving the committed bundle is the one a
-build of that ref produces. It refuses a tag not reachable from `main`, emits a
+build of that ref produces. Because matching a bundle to a fresh build of itself
+says nothing about whether that bundle *runs*, it then **executes** the bundle
+(`npm run test:dist`, [`scripts/dist-behaviour.mjs`](scripts/dist-behaviour.mjs))
+with real `INPUT_*` variables against a live TLS endpoint, and asserts the guards
+documented above — the egress refusals, the private-CA trust, the withdrawn
+`skip-tls-verify`, the rejection of a hostile registry-supplied module id, the
+outputs and the credential masking. CI runs the same check on every pull request.
+It refuses a tag not reachable from `main`, emits a
 [build-provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations)
 over `dist/index.js` plus a CycloneDX SBOM, and only then moves the `v1` alias.
 Verify a release with:
