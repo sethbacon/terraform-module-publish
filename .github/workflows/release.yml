@@ -52,6 +52,10 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
+          # A release job publishes runtime artifacts, so a poisoned dependency
+          # cache would reach the bundle consumers execute. Restoring from cache
+          # buys nothing here anyway — this runs once per tag.
+          package-manager-cache: false
 
       - run: npm ci
       - run: npm run lint
@@ -109,11 +113,21 @@ jobs:
         run: gh release create "$TAG" --verify-tag --generate-notes sbom.cyclonedx.json
 
       # Moving the floating major alias is what actually changes what every
-      # `@v1` consumer executes, so it happens here, after the gate.
+      # `@v1` consumer executes, so it happens here, after the gate. Moved
+      # through the API rather than `git push`: checkout runs with
+      # persist-credentials: false, so the working copy holds no credential to
+      # push with. GH_TOKEN carries the job's `contents: write`.
       - name: Move the floating major alias
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
         run: |
           MAJOR="${TAG%%.*}"
-          git tag -f "$MAJOR" "$TAG"
-          git push --force origin "refs/tags/$MAJOR"
+          if gh api "repos/$REPO/git/ref/tags/$MAJOR" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$REPO/git/refs/tags/$MAJOR" -f sha="$SHA" -F force=true
+          else
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/tags/$MAJOR" -f sha="$SHA"
+          fi
+          echo "Moved $MAJOR -> $SHA"
