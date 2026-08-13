@@ -71,6 +71,14 @@ jobs:
             exit 1
           fi
 
+      # Matching the bundle to a fresh build of itself says nothing about
+      # whether it RUNS: a bundler that cannot resolve a dependency can emit a
+      # bundle that throws at require time and still rebuild byte-identically.
+      # A release moves the `v1` alias, so the last check before that happens is
+      # the one that executes the artifact and watches its guards behave.
+      - name: Execute the tagged bundle and assert its guards
+        run: npm run test:dist
+
       - run: npm audit --omit=dev --audit-level=moderate
 
   release:

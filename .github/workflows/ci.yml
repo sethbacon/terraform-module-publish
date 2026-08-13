@@ -32,3 +32,17 @@ jobs:
             fi
             exit 1
           fi
+
+      # Runs in this job, immediately after the build above, so it drives the
+      # bundle that build just produced.
+      #
+      # The staleness gate is not cover for this and never was: it compares
+      # dist/index.js to a fresh build OF ITSELF, so a bundle that throws at
+      # require time passes it byte-for-byte. `@vercel/ncc` 0.38.4 failed loudly
+      # when it could not bundle a dependency; 0.44.1 exits 0 and emits a
+      # `webpackMissingModule` stub in its place. Lint, tests and dist-sync all
+      # stay green while every consumer of `uses: ...@v1` fails before a line of
+      # the action runs. This step is the only one here that executes the
+      # artifact consumers execute.
+      - name: Execute the built bundle and assert its guards
+        run: npm run test:dist
