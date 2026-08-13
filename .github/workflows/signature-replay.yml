@@ -68,7 +68,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: signature-replay-${ github.ref }
+  group: signature-replay-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
