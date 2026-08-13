@@ -1,6 +1,6 @@
 import * as core from '@actions/core'
 import { createHostAuthorizer } from './egress'
-import { createHttpsClient } from './http'
+import { createHttpsClient, describeError, resolveTlsTrust } from './http'
 import { RegistryPublisher, RegistryType } from './types'
 import { PrivateRegistryPublisher } from './private-publisher'
 import { HcpPublisher } from './hcp-publisher'
@@ -29,12 +29,15 @@ function buildPublisher(): RegistryPublisher {
   // One egress decision for the run, applied by the client to the initial URL
   // and to every redirect hop of every request it makes.
   const authorizeHost = createHostAuthorizer(core.getInput('registry-allowed-hosts'))
+  // Resolved for every registry type, not just the one that used to read it, so
+  // that `skip-tls-verify` is refused wherever it is set rather than silently
+  // ignored on the HCP path.
+  const tlsTrust = resolveTlsTrust(core.getInput('skip-tls-verify'), core.getInput('ca-cert'))
 
   if (registryType === 'private') {
     const apiKey = required('api-key')
     core.setSecret(apiKey)
-    const skipTlsVerify = core.getBooleanInput('skip-tls-verify')
-    return new PrivateRegistryPublisher(createHttpsClient(!skipTlsVerify, authorizeHost), {
+    return new PrivateRegistryPublisher(createHttpsClient(authorizeHost, tlsTrust), {
       ...coordinates,
       registryUrl: required('registry-url'),
       apiKey,
@@ -46,12 +49,16 @@ function buildPublisher(): RegistryPublisher {
   if (registryType === 'hcp') {
     const token = required('hcp-token')
     core.setSecret(token)
-    return new HcpPublisher(createHttpsClient(true, authorizeHost), {
+    return new HcpPublisher(createHttpsClient(authorizeHost, tlsTrust), {
       ...coordinates,
       address: core.getInput('hcp-address') || 'https://app.terraform.io',
       token,
       vcsRepoIdentifier: core.getInput('vcs-repo-identifier') || '',
-      vcsBranch: core.getInput('vcs-branch') || 'main',
+      // Empty by design: a module created without a branch is tag-based, and
+      // HCP imports its versions from pushed tags. The former 'main' default
+      // made every module branch-based, whose versions need a module-archive
+      // upload this action does not perform.
+      vcsBranch: core.getInput('vcs-branch') || '',
       vcsOauthTokenId: core.getInput('vcs-oauth-token-id') || '',
       commitSha: core.getInput('commit-sha') || '',
       waitForPublish,
@@ -69,7 +76,7 @@ async function run(): Promise<void> {
     core.setOutput('published', String(result.published))
     core.setOutput('message', result.message)
   } catch (error) {
-    core.setFailed(error instanceof Error ? error.message : String(error))
+    core.setFailed(describeError(error))
   }
 }
 
