@@ -157,3 +157,38 @@ drift apart.
     provider: aws
     version: 1.2.3
 ```
+
+## Pinning this action
+
+The examples above use `@v1` for readability. **`v1` is a mutable tag** — this
+repository's maintainers move it to each new `v1.x`, so what your workflow
+executes changes without any diff on your side. That is a convenience, and it is
+a trust decision you are making about this repository. What you actually run is
+a ~500 KB minified, sourcemap-free `ncc` bundle, so a substitution is not
+something anyone will catch by reading a diff.
+
+For supply-chain-sensitive workflows, pin the full commit SHA instead:
+
+```yaml
+- uses: sethbacon/terraform-module-publish@<full-40-char-sha> # v1.0.1
+  with:
+    registry-type: private
+    # ...
+```
+
+The trailing comment is what makes the pin maintainable — Dependabot reads it,
+and so does the next human. The tradeoff is the mirror image of `@v1`: a SHA pin
+never changes under you, and it never picks up a fix either, so it needs
+updating deliberately.
+
+Releases are cut by [`release.yml`](.github/workflows/release.yml), which
+against the tagged tree re-runs lint, tests, `npm audit` and — the point of the
+tag trigger — **the dist-sync check**, proving the committed bundle is the one a
+build of that ref produces. It refuses a tag not reachable from `main`, emits a
+[build-provenance attestation](https://docs.github.com/actions/security-guides/using-artifact-attestations)
+over `dist/index.js` plus a CycloneDX SBOM, and only then moves the `v1` alias.
+Verify a release with:
+
+```bash
+gh attestation verify --owner sethbacon --repo terraform-module-publish dist/index.js
+```

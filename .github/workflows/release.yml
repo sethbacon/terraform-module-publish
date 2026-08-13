@@ -1,0 +1,133 @@
+---
+name: Release
+
+# Cuts a release for a pushed v*.*.* tag, and only after the tag's own tree has
+# passed the same gate main does.
+#
+# The gap this closes: CI fired only on push/pull_request to main, so a tag
+# could be created at any commit — including one whose dist/index.js was never
+# rebuilt or verified — and consumers resolving `@v1` would execute it. What a
+# consumer runs is a ~500 KB minified, sourcemap-free ncc bundle that no human
+# will ever diff, so the dist-sync gate has to hold at the tag, not just on main.
+"on":
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Unprivileged: runs the full untrusted dependency lifecycle (npm ci, build,
+  # test) in a job holding no release or attestation permissions, so a poisoned
+  # transitive dependency cannot reach them.
+  verify:
+    name: Verify the tagged tree
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history so the ancestry check below can walk back to main.
+          fetch-depth: 0
+
+      - name: Verify the tag is reachable from main
+        run: |
+          git fetch --no-tags --quiet origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::The tagged commit is not reachable from main. Refusing to release an unmerged ref."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          # A release job publishes runtime artifacts, so a poisoned dependency
+          # cache would reach the bundle consumers execute. Restoring from cache
+          # buys nothing here anyway — this runs once per tag.
+          package-manager-cache: false
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+      # The whole point of the tag trigger: prove the committed bundle at THIS
+      # ref is the one a build of this ref produces.
+      - name: Fail if the committed dist is stale at the tag
+        run: |
+          npm run build
+          if ! git diff --exit-code -- dist/index.js; then
+            echo "::error::dist/index.js at this tag does not match a fresh build. Refusing to release a bundle that was never verified."
+            exit 1
+          fi
+
+      - run: npm audit --omit=dev --audit-level=moderate
+
+  release:
+    name: Publish release + provenance
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release
+      id-token: write # provenance signing
+      attestations: write
+    steps:
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: sbom.cyclonedx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      # dist/index.js is the artifact — it is what every consumer executes —
+      # so provenance binds to those bytes, not to the source tree.
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/index.js
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --verify-tag --generate-notes sbom.cyclonedx.json
+
+      # Moving the floating major alias is what actually changes what every
+      # `@v1` consumer executes, so it happens here, after the gate. Moved
+      # through the API rather than `git push`: checkout runs with
+      # persist-credentials: false, so the working copy holds no credential to
+      # push with. GH_TOKEN carries the job's `contents: write`.
+      - name: Move the floating major alias
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          MAJOR="${TAG%%.*}"
+          if gh api "repos/$REPO/git/ref/tags/$MAJOR" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$REPO/git/refs/tags/$MAJOR" -f sha="$SHA" -F force=true
+          else
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/tags/$MAJOR" -f sha="$SHA"
+          fi
+          echo "Moved $MAJOR -> $SHA"

@@ -1,0 +1,103 @@
+---
+name: Security scan
+
+# Two checks that nothing else in this repo performs.
+#
+# `audit` runs on a schedule as well as on PRs because the vulnerable
+# dependency is usually not one a PR touches: undici is inlined into
+# dist/index.js, so an advisory published against the pinned version is live in
+# every consumer's job the moment it lands, and dependency-review would never
+# mention it.
+#
+# `workflows` lints the workflow files themselves. Either zizmor or actionlint
+# would have flagged the missing `permissions:` block and the mutable tag pins
+# that this repo carried until now.
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: npm audit (runtime deps)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - run: npm ci --ignore-scripts
+
+      # --omit=dev: a devDependency advisory does not reach a consumer, since
+      # only dist/index.js ships. moderate, not high: this action carries a
+      # bearer credential to a remote host, so a moderate flaw in the bundled
+      # HTTP stack is not obviously acceptable.
+      - name: Audit runtime dependencies
+        run: npm audit --omit=dev --audit-level=moderate
+
+  # The dist-sync step in ci.yml answers "is dist stale in THIS pull request?".
+  # That is a different question from "does the committed bundle still match a
+  # build of the current lockfile?", which can drift with no PR open at all —
+  # a transitive dependency resolving differently, or a bundled-dependency
+  # Dependabot PR merged without the rebuild. Nothing surfaced that before.
+  bundle-drift:
+    name: Committed dist matches a fresh build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Fail if the committed bundle has drifted
+        run: |
+          if ! git diff --exit-code -- dist/index.js; then
+            echo "::error::dist/index.js no longer matches a build of the current lockfile. A bundled dependency changed without the bundle being rebuilt — check out main, run 'npm run build', and commit dist/index.js."
+            exit 1
+          fi
+
+  workflows:
+    name: Lint workflows (zizmor)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2

@@ -12,8 +12,10 @@ jobs:
     name: Lint, test, dist sync
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
       - run: npm ci
@@ -23,6 +25,10 @@ jobs:
         run: |
           npm run build
           if ! git diff --exit-code -- dist/index.js; then
-            echo "::error::dist is out of date — run 'npm run build' and commit the result."
+            if [ "${GITHUB_ACTOR}" = "dependabot[bot]" ]; then
+              echo "::error::A bundled dependency changed, so dist/index.js no longer matches src/. Dependabot only edits package.json and package-lock.json — it never runs the build. Check out this branch, run 'npm run build', and commit dist/index.js."
+            else
+              echo "::error::dist is out of date — run 'npm run build' and commit the result."
+            fi
             exit 1
           fi

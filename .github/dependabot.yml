@@ -1,0 +1,28 @@
+---
+version: 2
+
+updates:
+  # npm. Note the standing friction, documented in ci.yml's dist-sync step: this
+  # action commits its ncc bundle, so any update to a BUNDLED dependency makes
+  # dist/index.js stale and the PR red by construction — Dependabot edits the
+  # manifests but never runs the build. The dist-sync step prints an actionable
+  # message naming that when the actor is dependabot[bot]; the branch still has
+  # to be checked out, rebuilt and pushed by a human.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: build(deps)
+      prefix-development: build(deps-dev)
+
+  # Without this, the SHA pins in the workflows are frozen rather than
+  # maintained — pinning without an update path just converts "runs whatever the
+  # tag points at" into "runs a version that is never patched".
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci(deps)
