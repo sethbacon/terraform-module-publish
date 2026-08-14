@@ -132,6 +132,7 @@ describe('a remote body reaching the annotation is bounded and stripped', () => 
     vcsBranch: '',
     vcsOauthTokenId: 'ot-1',
     commitSha: 'abc123',
+    moduleDirectory: '.',
     waitForPublish: false,
     timeoutSeconds: 1,
   }

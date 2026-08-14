@@ -111,6 +111,7 @@ describe('HCP: an unexpected module-check status fails at the cause', () => {
       vcsBranch: '',
       vcsOauthTokenId: 'ot-1',
       commitSha: 'abc',
+      moduleDirectory: '.',
       waitForPublish: false,
       timeoutSeconds: 30,
     }

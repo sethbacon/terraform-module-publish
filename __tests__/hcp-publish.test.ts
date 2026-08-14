@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { HcpPublisher, publishMode, requiresContentUpload, vcsModuleBody } from '../src/hcp-publisher'
+import { HcpPublisher, publishMode, uploadUrl, vcsModuleBody } from '../src/hcp-publisher'
 import type { HcpOptions } from '../src/hcp-publisher'
 import type { HttpResponse } from '../src/http'
 
@@ -7,17 +7,16 @@ import type { HttpResponse } from '../src/http'
  * The class test for "did the publish this action reports actually happen".
  *
  * HCP takes module versions two ways, and the action must not treat them the
- * same. A TAG-based VCS module gets its versions from pushed git tags; a
- * BRANCH-based or no-VCS module gets a version from `POST .../versions` that
- * stays at status `pending` until a gzipped module archive is PUT to the
- * `links.upload` URL in the response. This action does not upload module
- * content, so the only two honest outcomes are: complete the tag-based publish,
- * or fail the upload-driven one — never announce a version that HCP is holding
- * at `pending`.
+ * same. A TAG-based VCS module gets its versions from pushed git tags, so there
+ * is nothing to create and nothing to upload. A BRANCH-based or no-VCS module
+ * gets a version from `POST .../versions` that stays at status `pending` until
+ * a gzipped module archive is PUT to the `links.upload` URL in the response —
+ * so for that class the publish is only complete once the upload has landed.
  *
  * The rows drive the publisher through a fake HTTP client and assert on BOTH
  * the outcome and the exact requests issued, because "did not POST versions for
- * a tag-based module" is half of what makes the flow correct.
+ * a tag-based module" and "did PUT the archive for an upload-driven one" are
+ * half of what makes the flow correct.
  */
 
 const UPLOAD_URL = 'https://archivist.terraform.io/v1/object/dmF1bHQ6c2VjcmV0LWNhcGFiaWxpdHk'
@@ -48,6 +47,17 @@ const branchBasedModule = JSON.stringify({
   },
 })
 
+/** The same branch-based module, carrying version statuses for the wait loop. */
+const branchBasedModuleWith = (statuses: Array<{ version: string; status: string }>) =>
+  JSON.stringify({
+    data: {
+      attributes: {
+        'vcs-repo': { identifier: 'myorg/terraform-aws-vpc', branch: 'main' },
+        'version-statuses': statuses,
+      },
+    },
+  })
+
 /** A private module with no VCS repo at all: also upload-driven. */
 const noVcsModule = JSON.stringify({ data: { attributes: { 'version-statuses': [] } } })
 
@@ -71,27 +81,47 @@ const options = (over: Partial<HcpOptions> = {}): HcpOptions => ({
   vcsBranch: '',
   vcsOauthTokenId: 'ot-123',
   commitSha: 'abc123',
+  moduleDirectory: '.',
   waitForPublish: false,
   timeoutSeconds: 1,
   ...over,
 })
 
+/** Stand-in for the gzipped module archive; the real one is tested in archive.test.ts. */
+const ARCHIVE = new Uint8Array([0x1f, 0x8b, 0x08, 0x00, 0x99])
+const fakeArchive = () => Promise.resolve(ARCHIVE)
+
 /** Responses per URL, consumed in order; the last one repeats for further polls. */
 type Script = Record<string, HttpResponse[]>
+
+/** One request as the fake client saw it, so a test can assert what was sent. */
+interface Sent {
+  method: string
+  url: string
+  headers: Record<string, string>
+  body?: string | Uint8Array
+}
 
 /** Replays a script and records the requests that consumed it. */
 function fakeHttp(script: Script) {
   const calls: string[] = []
+  const sent: Sent[] = []
   const remaining: Script = Object.fromEntries(
     Object.entries(script).map(([url, responses]) => [url, [...responses]]),
   )
-  const http = async (method: string, url: string): Promise<HttpResponse> => {
+  const http = async (
+    method: string,
+    url: string,
+    headers: Record<string, string>,
+    body?: string | Uint8Array,
+  ): Promise<HttpResponse> => {
     calls.push(`${method} ${url}`)
+    sent.push({ method, url, headers, body })
     const queue = remaining[url]
     if (!queue?.length) throw new Error(`unscripted request: ${method} ${url}`)
     return queue.length === 1 ? queue[0] : queue.shift()!
   }
-  return { http, calls }
+  return { http, calls, sent }
 }
 
 describe('HCP publish mode is read off the module HCP describes', () => {
@@ -106,13 +136,31 @@ describe('HCP publish mode is read off the module HCP describes', () => {
   })
 
   it.each([
-    ['a version answered with an upload URL needs content', versionPending, true],
-    ['a version answered without one does not', JSON.stringify({ data: { attributes: {} } }), false],
-    ['an empty upload URL does not', JSON.stringify({ data: { links: { upload: '' } } }), false],
-    ['a non-JSON body does not', 'not json at all', false],
-    ['an empty body does not', '', false],
+    ['a version answered with an upload URL needs content', versionPending, UPLOAD_URL],
+    ['a version answered without one does not', JSON.stringify({ data: { attributes: {} } }), undefined],
+    ['an empty upload URL does not', JSON.stringify({ data: { links: { upload: '' } } }), undefined],
+    ['a non-JSON body does not', 'not json at all', undefined],
+    ['an empty body does not', '', undefined],
   ])('%s', (_what, body, expected) => {
-    expect(requiresContentUpload(body)).toBe(expected)
+    expect(uploadUrl(body)).toBe(expected)
+  })
+
+  /**
+   * The upload link becomes a request destination carrying the module source,
+   * and it is chosen by whatever host `hcp-address` names. A downgrade to
+   * cleartext, or to a non-network scheme, is refused before the client sees it.
+   */
+  it.each([
+    ['http', JSON.stringify({ data: { links: { upload: 'http://archivist.example.com/o/1' } } })],
+    ['file', JSON.stringify({ data: { links: { upload: 'file:///etc/passwd' } } })],
+  ])('refuses a %s upload link', (_scheme, body) => {
+    expect(() => uploadUrl(body)).toThrow('only ever sent over https')
+  })
+
+  it('refuses an upload link that is not a URL at all', () => {
+    expect(() => uploadUrl(JSON.stringify({ data: { links: { upload: 'not a url' } } }))).toThrow(
+      'not a valid URL',
+    )
   })
 })
 
@@ -162,23 +210,50 @@ const FLOW_ROWS: FlowRow[] = [
     calls: [`GET ${MODULE_URL}`, `GET ${MODULE_URL}`],
   },
   {
-    what: 'branch-based: a version held at pending fails the step instead of reporting a publish',
+    what: 'branch-based: the created version is completed by uploading the module archive',
     over: { vcsBranch: 'main' },
     script: {
       [MODULE_URL]: [ok(branchBasedModule)],
       [VERSIONS_URL]: [{ status: 201, body: versionPending }],
+      [UPLOAD_URL]: [{ status: 200, body: '' }],
     },
-    reject: "status 'pending'",
-    calls: [`GET ${MODULE_URL}`, `POST ${VERSIONS_URL}`],
+    published: true,
+    message: /module archive uploaded/,
+    calls: [`GET ${MODULE_URL}`, `POST ${VERSIONS_URL}`, `PUT ${UPLOAD_URL}`],
   },
   {
-    what: 'no-VCS module: the same upload requirement fails the step',
+    what: 'no-VCS module: the same upload completes the publish',
     script: {
       [MODULE_URL]: [ok(noVcsModule)],
       [VERSIONS_URL]: [{ status: 201, body: versionPending }],
+      [UPLOAD_URL]: [{ status: 200, body: '' }],
     },
-    reject: "status 'pending'",
-    calls: [`GET ${MODULE_URL}`, `POST ${VERSIONS_URL}`],
+    published: true,
+    message: /module archive uploaded/,
+    calls: [`GET ${MODULE_URL}`, `POST ${VERSIONS_URL}`, `PUT ${UPLOAD_URL}`],
+  },
+  {
+    what: 'a rejected upload fails the step rather than reporting the version published',
+    over: { vcsBranch: 'main' },
+    script: {
+      [MODULE_URL]: [ok(branchBasedModule)],
+      [VERSIONS_URL]: [{ status: 201, body: versionPending }],
+      [UPLOAD_URL]: [{ status: 403, body: 'SignatureDoesNotMatch' }],
+    },
+    reject: 'Failed to upload the module archive (HTTP 403)',
+    calls: [`GET ${MODULE_URL}`, `POST ${VERSIONS_URL}`, `PUT ${UPLOAD_URL}`],
+  },
+  {
+    what: 'waiting: the version is only reported ready once HCP moves it past pending',
+    over: { vcsBranch: 'main', waitForPublish: true },
+    script: {
+      [MODULE_URL]: [ok(branchBasedModule), ok(branchBasedModuleWith([{ version: '1.2.3', status: 'ok' }]))],
+      [VERSIONS_URL]: [{ status: 201, body: versionPending }],
+      [UPLOAD_URL]: [{ status: 200, body: '' }],
+    },
+    published: true,
+    message: /module archive uploaded/,
+    calls: [`GET ${MODULE_URL}`, `POST ${VERSIONS_URL}`, `PUT ${UPLOAD_URL}`, `GET ${MODULE_URL}`],
   },
   {
     what: 'branch-based: a version created without an upload requirement still publishes',
@@ -220,15 +295,17 @@ const FLOW_ROWS: FlowRow[] = [
     calls: [`GET ${MODULE_URL}`, `POST ${VCS_URL}`],
   },
   {
-    what: 'a missing module created WITH a branch goes down the upload-driven path and fails closed',
+    what: 'a missing module created WITH a branch goes down the upload-driven path and uploads',
     over: { vcsBranch: 'main' },
     script: {
       [MODULE_URL]: [{ status: 404, body: '' }],
       [VCS_URL]: [{ status: 201, body: '{}' }],
       [VERSIONS_URL]: [{ status: 201, body: versionPending }],
+      [UPLOAD_URL]: [{ status: 200, body: '' }],
     },
-    reject: "status 'pending'",
-    calls: [`GET ${MODULE_URL}`, `POST ${VCS_URL}`, `POST ${VERSIONS_URL}`],
+    published: true,
+    message: /module archive uploaded/,
+    calls: [`GET ${MODULE_URL}`, `POST ${VCS_URL}`, `POST ${VERSIONS_URL}`, `PUT ${UPLOAD_URL}`],
   },
   {
     what: 'tag-based, waiting, version never imported: times out rather than claiming success',
@@ -242,7 +319,7 @@ const FLOW_ROWS: FlowRow[] = [
 describe('HCP publish flow', () => {
   it.each(FLOW_ROWS)('$what', async (row) => {
     const { http, calls } = fakeHttp(row.script)
-    const publisher = new HcpPublisher(http, options(row.over), () => {})
+    const publisher = new HcpPublisher(http, options(row.over), () => {}, () => {}, () => {}, fakeArchive)
     if (row.reject) {
       await expect(publisher.publish()).rejects.toThrow(row.reject)
     } else {
@@ -252,21 +329,109 @@ describe('HCP publish flow', () => {
     }
     expect(calls).toEqual(row.calls)
   })
+})
 
-  it('never echoes the archivist upload URL, which is a bearer capability', async () => {
-    const { http } = fakeHttp({
-      [MODULE_URL]: [ok(branchBasedModule)],
-      [VERSIONS_URL]: [{ status: 201, body: versionPending }],
-    })
+/**
+ * The upload request is the one request in this class that goes to a host named
+ * by a RESPONSE BODY rather than by operator input, and it carries the module
+ * source. What it must and must not contain is asserted on the peer's own view
+ * of it.
+ */
+describe('the module-archive upload', () => {
+  const uploadScript = () => ({
+    [MODULE_URL]: [ok(branchBasedModule)],
+    [VERSIONS_URL]: [{ status: 201, body: versionPending }],
+    [UPLOAD_URL]: [{ status: 200, body: '' }],
+  })
+
+  const run = async (script: Script = uploadScript()) => {
+    const { http, sent } = fakeHttp(script)
     const logged: string[] = []
-    const publisher = new HcpPublisher(http, options({ vcsBranch: 'main' }), (m) => logged.push(m))
+    const masked: string[] = []
+    const publisher = new HcpPublisher(
+      http,
+      options({ vcsBranch: 'main' }),
+      (m) => logged.push(m),
+      (m) => logged.push(m),
+      (s) => masked.push(s),
+      fakeArchive,
+    )
     const error = await publisher.publish().then(
       () => null,
       (e: unknown) => e as Error,
     )
-    expect(error).toBeInstanceOf(Error)
-    expect(error!.message).toContain("status 'pending'")
-    expect(error!.message).not.toContain(UPLOAD_URL)
+    return { sent, logged, masked, error, put: sent.find((s) => s.method === 'PUT') }
+  }
+
+  it('sends the archive bytes as the request body', async () => {
+    const { put } = await run()
+    expect(put?.body).toBe(ARCHIVE)
+  })
+
+  /**
+   * The HCP token is scoped to the organization's registry modules. The upload
+   * host is a different host, chosen by a response body, and the URL is itself
+   * the authorization — so attaching the token would hand that credential to
+   * whatever host HCP (or something impersonating it) named.
+   */
+  it('does not send the HCP bearer token to the upload host', async () => {
+    const { put } = await run()
+    expect(Object.keys(put!.headers).map((h) => h.toLowerCase())).not.toContain('authorization')
+    expect(JSON.stringify(put!.headers)).not.toContain('secret-token')
+  })
+
+  it('registers the capability URL with the job mask before it is used', async () => {
+    const { masked, sent } = await run()
+    expect(masked).toContain(UPLOAD_URL)
+    // Ordering is the point: a mask applied after the request has been made
+    // cannot redact a line already written.
+    expect(sent.findIndex((s) => s.method === 'PUT')).toBeGreaterThan(-1)
+  })
+
+  it('masks the query-string credential of a presigned upload link too', async () => {
+    const presigned = 'https://blob.example.com/o/abc?sig=SECRETSIGVALUE&se=2030-01-01'
+    const { masked } = await run({
+      [MODULE_URL]: [ok(branchBasedModule)],
+      [VERSIONS_URL]: [{ status: 201, body: JSON.stringify({ data: { links: { upload: presigned } } }) }],
+      [presigned]: [{ status: 200, body: '' }],
+    })
+    expect(masked).toContain(presigned)
+    expect(masked).toContain('SECRETSIGVALUE')
+  })
+
+  it('never echoes the upload URL, which is a bearer capability, into the log', async () => {
+    const { logged } = await run()
     expect(logged.join('\n')).not.toContain(UPLOAD_URL)
+    // The host alone is what an operator needs in order to allowlist it.
+    expect(logged.join('\n')).toContain('archivist.terraform.io')
+  })
+
+  it('scrubs the capability out of an upload failure that echoes it back', async () => {
+    const { error } = await run({
+      [MODULE_URL]: [ok(branchBasedModule)],
+      [VERSIONS_URL]: [{ status: 201, body: versionPending }],
+      [UPLOAD_URL]: [{ status: 403, body: `Denied for ${UPLOAD_URL}` }],
+    })
+    expect(error).toBeInstanceOf(Error)
+    expect(error!.message).toContain('Failed to upload the module archive (HTTP 403)')
+    expect(error!.message).not.toContain(UPLOAD_URL)
+  })
+
+  it('does not build the archive at all on the tag-based path', async () => {
+    const { http } = fakeHttp({ [MODULE_URL]: [ok(tagBasedModule())] })
+    let built = 0
+    const publisher = new HcpPublisher(
+      http,
+      options(),
+      () => {},
+      () => {},
+      () => {},
+      () => {
+        built++
+        return fakeArchive()
+      },
+    )
+    await publisher.publish()
+    expect(built).toBe(0)
   })
 })

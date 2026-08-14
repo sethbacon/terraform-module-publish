@@ -62,11 +62,21 @@ inputs:
     description: >-
       VCS branch for a VCS-connected HCP module. Leave empty (the default) to
       create a TAG-based module, whose versions HCP imports from pushed git
-      tags. Setting a branch creates a branch-based module, whose versions stay
-      'pending' until a module archive is uploaded — which this action does not
-      do, and which now fails the step rather than reporting a publish.
+      tags. Setting a branch creates a branch-based module, whose versions are
+      created through the API and stay 'pending' until this action uploads the
+      archive built from `module-directory`.
     required: false
     default: ""
+  module-directory:
+    description: >-
+      Directory holding the module source, archived and uploaded when HCP
+      answers version creation with an upload link — that is, for a branch-based
+      module (`vcs-branch` set) or one with no VCS repo. Its contents land at the
+      archive root, so it must hold the module's root .tf files. `.git` and
+      `.terraform` are excluded. Unused on the tag-based path, where HCP takes
+      the content from the pushed tag itself.
+    required: false
+    default: "."
   vcs-oauth-token-id:
     description: HCP VCS OAuth token ID used to create the module if missing.
     required: false

@@ -13,11 +13,17 @@ export interface HttpResponse {
     body: string;
 }
 
+/**
+ * `body` is `Uint8Array` as well as `string` because the HCP module-archive
+ * upload PUTs gzipped tar bytes. A buffer rather than a stream: the shared
+ * client retries a transient transport failure, and a stream is consumed by the
+ * first attempt, so a retried upload would send an empty body.
+ */
 export type HttpClient = (
     method: string,
     url: string,
     headers: Record<string, string>,
-    body?: string,
+    body?: string | Uint8Array,
 ) => Promise<HttpResponse>;
 
 /** Optional per-run tuning for {@link createHttpsClient}. */
@@ -97,7 +103,10 @@ export function createHttpsClient(authorizeHost: AuthorizeHost, options: HttpsCl
             fetchOptions: () => {
                 const init: RequestInit = { method, headers };
                 if (body !== undefined) {
-                    init.body = body;
+                    // Cast: a Uint8Array IS a valid `fetch` body at runtime, but
+                    // the DOM lib's `BodyInit` names `ArrayBufferView<ArrayBuffer>`
+                    // and a `Uint8Array<ArrayBufferLike>` does not satisfy it.
+                    init.body = body as BodyInit;
                 }
                 if (dispatcher) {
                     (init as RequestInit & { dispatcher: unknown }).dispatcher = dispatcher;
