@@ -1,5 +1,5 @@
 import { validateUrlPathSegment } from '@4cloudguru/pipeline-task-core';
-import { HttpClient, bodyExcerpt, parseJson, delay } from './http';
+import { HttpClient, httpError, parseJson, pollUntil, trimTrailingSlash } from './http';
 import { ModuleCoordinates, PublishResult, RegistryPublisher } from './types';
 
 /** Inputs for publishing to a private registry (terraform-registry-backend). */
@@ -17,10 +17,6 @@ interface ModuleVersionEntry {
 interface ModuleResponse {
     id?: string;
     versions?: ModuleVersionEntry[];
-}
-
-export function trimTrailingSlash(url: string): string {
-    return url.replace(/\/+$/, '');
 }
 
 export function moduleUrl(base: string, c: ModuleCoordinates): string {
@@ -85,11 +81,19 @@ export class PrivateRegistryPublisher implements RegistryPublisher {
             );
         }
         if (moduleResp.status < 200 || moduleResp.status >= 300) {
-            this.debug(`Registry module-resolution response body: ${moduleResp.body}`);
-            throw new Error(
-                `Failed to resolve module (HTTP ${moduleResp.status}): ${bodyExcerpt(moduleResp.body)}`,
-            );
+            throw httpError('resolve module', moduleResp, this.debug);
         }
+        // Read BEFORE the sync is triggered, because afterwards the answer is
+        // ambiguous. action.yml and the README both promise `published: "false"
+        // if it already existed", and this path had two return points, both
+        // `published: true` — it could not produce false for any input at all.
+        // The sync is still triggered either way (it is idempotent, and
+        // re-syncing an existing version is the harmless half of the promise);
+        // what changes is that the OUTPUT now reports what actually happened,
+        // so a consumer gating a release notification on `published == 'true'`
+        // stops firing on every run.
+        const alreadyPublished = hasVersion(moduleResp.body, version);
+
         const moduleId = parseJson<ModuleResponse>(moduleResp.body, 'The registry module response').id;
         if (!moduleId) {
             throw new Error('Registry response did not include a module id.');
@@ -97,15 +101,14 @@ export class PrivateRegistryPublisher implements RegistryPublisher {
 
         const syncResp = await this.http('POST', syncUrl(registryUrl, moduleId), authHeader);
         if (syncResp.status !== 202) {
-            this.debug(`Registry sync-trigger response body: ${syncResp.body}`);
-            throw new Error(
-                `Failed to trigger sync (HTTP ${syncResp.status}): ${bodyExcerpt(syncResp.body)}`,
-            );
+            throw httpError('trigger sync', syncResp, this.debug);
         }
         this.log(`Sync triggered for ${namespace}/${name}/${provider}.`);
 
         if (!this.options.waitForPublish) {
-            return { published: true, message: `Sync triggered for version ${version}.` };
+            return alreadyPublished
+                ? { published: false, message: `Version ${version} already existed; sync re-triggered.` }
+                : { published: true, message: `Sync triggered for version ${version}.` };
         }
 
         if (!(await this.waitForVersion(modUrl, authHeader))) {
@@ -113,20 +116,19 @@ export class PrivateRegistryPublisher implements RegistryPublisher {
                 `Timed out after ${this.options.timeoutSeconds}s waiting for version ${version} to appear in the registry.`,
             );
         }
-        return { published: true, message: `Version ${version} is available in the registry.` };
+        return alreadyPublished
+            ? { published: false, message: `Version ${version} already existed in the registry.` }
+            : { published: true, message: `Version ${version} is available in the registry.` };
     }
 
-    private async waitForVersion(modUrl: string, authHeader: Record<string, string>): Promise<boolean> {
-        const deadline = Date.now() + this.options.timeoutSeconds * 1000;
-        for (;;) {
-            const resp = await this.http('GET', modUrl, authHeader);
-            if (resp.status >= 200 && resp.status < 300 && hasVersion(resp.body, this.options.version)) {
-                return true;
-            }
-            if (Date.now() >= deadline) {
-                return false;
-            }
-            await delay(3000);
-        }
+    private waitForVersion(modUrl: string, authHeader: Record<string, string>): Promise<boolean> {
+        return pollUntil(
+            async () => {
+                const resp = await this.http('GET', modUrl, authHeader);
+                return resp.status >= 200 && resp.status < 300 && hasVersion(resp.body, this.options.version);
+            },
+            this.options.timeoutSeconds,
+            this.debug,
+        );
     }
 }

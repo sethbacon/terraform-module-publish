@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { moduleUrl, syncUrl, hasVersion, trimTrailingSlash } from '../src/private-publisher'
+import { moduleUrl, syncUrl, hasVersion } from '../src/private-publisher'
+import { trimTrailingSlash } from '../src/http'
 import {
   moduleUrl as hcpModuleUrl,
   versionsUrl,

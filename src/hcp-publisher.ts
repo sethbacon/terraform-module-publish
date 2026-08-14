@@ -1,4 +1,4 @@
-import { HttpClient, bodyExcerpt, parseJson, delay } from './http';
+import { HttpClient, httpError, parseJson, pollUntil, trimTrailingSlash } from './http';
 import { ModuleCoordinates, PublishResult, RegistryPublisher } from './types';
 
 /** Inputs for publishing to HCP Terraform / Terraform Enterprise. */
@@ -49,7 +49,7 @@ export type PublishMode = 'tag-based' | 'upload-driven';
 type HcpModuleRef = ModuleCoordinates & { address: string };
 
 export function moduleUrl(o: HcpModuleRef): string {
-    const base = o.address.replace(/\/+$/, '');
+    const base = trimTrailingSlash(o.address);
     return (
         `${base}/api/v2/organizations/${encodeURIComponent(o.namespace)}/registry-modules/private/` +
         `${encodeURIComponent(o.namespace)}/${encodeURIComponent(o.name)}/${encodeURIComponent(o.provider)}`
@@ -61,7 +61,7 @@ export function versionsUrl(o: HcpModuleRef): string {
 }
 
 export function vcsUrl(address: string, namespace: string): string {
-    return `${address.replace(/\/+$/, '')}/api/v2/organizations/${encodeURIComponent(namespace)}/registry-modules/vcs`;
+    return `${trimTrailingSlash(address)}/api/v2/organizations/${encodeURIComponent(namespace)}/registry-modules/vcs`;
 }
 
 /**
@@ -195,15 +195,20 @@ export class HcpPublisher implements RegistryPublisher {
             this.log(`Module not found; creating VCS-connected module ${o.namespace}/${o.name}/${o.provider}.`);
             const created = await this.http('POST', vcsUrl(o.address, o.namespace), headers, vcsModuleBody(o));
             if (created.status < 200 || created.status >= 300) {
-                this.debug(`HCP module-creation response body: ${created.body}`);
-                throw new Error(
-                    `Failed to create HCP module (HTTP ${created.status}): ${bodyExcerpt(created.body)}`,
-                );
+                throw httpError('create HCP module', created, this.debug);
             }
             mode = o.vcsBranch ? 'upload-driven' : 'tag-based';
         } else {
-            this.log(`Could not check existing module (HTTP ${check.status}); assuming the mode implied by vcs-branch.`);
-            mode = o.vcsBranch ? 'upload-driven' : 'tag-based';
+            // Fail here rather than logging and carrying on. Anything that is
+            // neither 2xx nor 404 is a 401 (bad or expired token), a 403, a 429
+            // or a 5xx — and the follow-up request fails on the same condition,
+            // so the consumer's error became "Failed to create version (HTTP
+            // 401)" with no hint that the true cause was already visible one
+            // call earlier and was deliberately ignored. The private publisher
+            // has always failed fast on its own non-2xx/non-404 case; this is
+            // the same rule, and it also stops a version-create proceeding
+            // against a module whose actual state was never confirmed.
+            throw httpError('check the existing HCP module', check, this.debug);
         }
 
         return mode === 'tag-based' ? this.publishTagBased(headers) : this.publishUploadDriven(headers);
@@ -246,10 +251,7 @@ export class HcpPublisher implements RegistryPublisher {
         if (versionResp.status === 422) {
             this.log(`Version ${o.version} already exists.`);
         } else if (versionResp.status < 200 || versionResp.status >= 300) {
-            this.debug(`HCP version-creation response body: ${versionResp.body}`);
-            throw new Error(
-                `Failed to create version (HTTP ${versionResp.status}): ${bodyExcerpt(versionResp.body)}`,
-            );
+            throw httpError('create version', versionResp, this.debug);
         } else if (requiresContentUpload(versionResp.body)) {
             // The upload URL HCP returned is deliberately NOT echoed: it is a
             // bearer capability to write that object, and step logs are not the
@@ -271,21 +273,18 @@ export class HcpPublisher implements RegistryPublisher {
         return { published: true, message: `Version ${o.version} published to HCP Terraform.` };
     }
 
-    private async waitForOk(headers: Record<string, string>): Promise<boolean> {
-        const deadline = Date.now() + this.options.timeoutSeconds * 1000;
-        for (;;) {
-            const resp = await this.http('GET', moduleUrl(this.options), headers);
-            if (
-                resp.status >= 200 &&
-                resp.status < 300 &&
-                versionStatus(resp.body, this.options.version) === 'ok'
-            ) {
-                return true;
-            }
-            if (Date.now() >= deadline) {
-                return false;
-            }
-            await delay(3000);
-        }
+    private waitForOk(headers: Record<string, string>): Promise<boolean> {
+        return pollUntil(
+            async () => {
+                const resp = await this.http('GET', moduleUrl(this.options), headers);
+                return (
+                    resp.status >= 200 &&
+                    resp.status < 300 &&
+                    versionStatus(resp.body, this.options.version) === 'ok'
+                );
+            },
+            this.options.timeoutSeconds,
+            this.debug,
+        );
     }
 }

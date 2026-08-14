@@ -5,15 +5,66 @@ import { RegistryPublisher, RegistryType } from './types'
 import { PrivateRegistryPublisher } from './private-publisher'
 import { HcpPublisher } from './hcp-publisher'
 
+/**
+ * Reads a conditionally-required input, failing with a message that names it.
+ *
+ * No `{ required: true }`: `core.getInput` throws its own generic "Input
+ * required and not supplied: x" one line EARLIER on the same condition, so the
+ * specific message below was unreachable at all eight call sites and no
+ * consumer ever saw it. Since half these inputs are required only for one
+ * `registry-type`, the message worth showing is the one that can say so.
+ */
 function required(name: string): string {
-  const value = core.getInput(name, { required: true })
-  if (!value) throw new Error(`Input '${name}' is required.`)
+  const value = core.getInput(name)
+  if (!value) {
+    throw new Error(`Input '${name}' is required for registry-type '${core.getInput('registry-type')}'.`)
+  }
   return value
 }
 
+const DEFAULT_TIMEOUT_SECONDS = 180
+
+/**
+ * `timeout-seconds`, with an invalid value reported rather than absorbed.
+ *
+ * `"0"`, `"-5"` and `"abc"` all silently became 180 — so an author who set
+ * `timeout-seconds: "0"` expecting a no-wait check waited the full three
+ * minutes with nothing in the log saying their value had been discarded.
+ */
 function parseTimeout(): number {
-  const parsed = parseInt(core.getInput('timeout-seconds') || '180', 10)
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 180
+  const raw = core.getInput('timeout-seconds').trim()
+  if (!raw) return DEFAULT_TIMEOUT_SECONDS
+  // Shape-checked, not just parseInt'd: parseInt stops at the first
+  // non-digit, so '1.5.2' became 1 and '30s' became 30 — a silently different
+  // timeout rather than a rejected value, which is the same defect one step
+  // quieter.
+  const parsed = /^[0-9]+$/.test(raw) ? Number(raw) : NaN
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    core.warning(
+      `timeout-seconds: '${raw}' is not a positive whole number; using the ` +
+        `${DEFAULT_TIMEOUT_SECONDS}s default. Set wait-for-publish: false to not wait at all.`,
+    )
+    return DEFAULT_TIMEOUT_SECONDS
+  }
+  return parsed
+}
+
+const REGISTRY_TYPES: readonly RegistryType[] = ['hcp', 'private']
+
+/**
+ * Narrows `registry-type` only after checking it.
+ *
+ * The value was `as RegistryType`-cast at the top of buildPublisher and not
+ * actually validated until an else-throw forty lines later, so between those
+ * points the type asserted something nothing had established — and any code
+ * inserted in between would have been type-checked against a lie.
+ */
+function registryType(): RegistryType {
+  const value = required('registry-type')
+  if (!REGISTRY_TYPES.includes(value as RegistryType)) {
+    throw new Error(`Unsupported registry-type '${value}'. Expected 'hcp' or 'private'.`)
+  }
+  return value as RegistryType
 }
 
 /**
@@ -43,7 +94,7 @@ function maskCredentials(): void {
 }
 
 function buildPublisher(): RegistryPublisher {
-  const registryType = required('registry-type') as RegistryType
+  const type = registryType()
   const coordinates = {
     namespace: required('namespace'),
     name: required('name'),
@@ -60,7 +111,7 @@ function buildPublisher(): RegistryPublisher {
   // ignored on the HCP path.
   const tlsTrust = resolveTlsTrust(core.getInput('skip-tls-verify'), core.getInput('ca-cert'))
 
-  if (registryType === 'private') {
+  if (type === 'private') {
     return new PrivateRegistryPublisher(
       createHttpsClient(authorizeHost, tlsTrust),
       {
@@ -75,7 +126,7 @@ function buildPublisher(): RegistryPublisher {
     )
   }
 
-  if (registryType === 'hcp') {
+  if (type === 'hcp') {
     return new HcpPublisher(
       createHttpsClient(authorizeHost, tlsTrust),
       {
@@ -105,7 +156,10 @@ function buildPublisher(): RegistryPublisher {
     )
   }
 
-  throw new Error(`Unsupported registry-type '${registryType}'. Expected 'hcp' or 'private'.`)
+  // Unreachable: registryType() already refused anything outside the union.
+  // Kept so the function is total for the compiler rather than relying on
+  // control-flow analysis of a runtime check in another function.
+  throw new Error(`Unsupported registry-type '${type as string}'.`)
 }
 
 async function run(): Promise<void> {
