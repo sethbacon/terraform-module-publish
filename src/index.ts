@@ -148,11 +148,17 @@ function buildPublisher(): RegistryPublisher {
         // event, so the binding is present by default and an operator who
         // needs a different commit still overrides it.
         commitSha: core.getInput('commit-sha') || process.env.GITHUB_SHA || '',
+        // The module root uploaded when HCP holds the created version at
+        // 'pending' pending content. Defaults to the workspace, which for the
+        // one-module-per-repo layout the registry convention assumes IS the
+        // module.
+        moduleDirectory: core.getInput('module-directory') || '.',
         waitForPublish,
         timeoutSeconds,
       },
       core.info,
       core.debug,
+      core.setSecret,
     )
   }
 

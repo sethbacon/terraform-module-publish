@@ -126,10 +126,18 @@ function startRegistry(respond) {
       method: req.method,
       path: req.url,
       auth: req.headers.authorization ?? '',
+      contentType: req.headers['content-type'] ?? '',
       body: '',
+      // Raw chunks as well as the decoded string: the module-archive upload is
+      // gzip, and `body += chunk` decodes as UTF-8, which mangles binary. The
+      // only honest way to assert "a valid archive arrived" is over the bytes.
+      chunks: [],
     }
     requests.push(record)
-    req.on('data', (d) => (record.body += d))
+    req.on('data', (d) => {
+      record.body += d
+      record.chunks.push(d)
+    })
     req.on('end', () => respond(req, res))
   })
   return new Promise((resolve) => {
@@ -690,6 +698,211 @@ console.log('\n=== an explicit commit-sha still wins over GITHUB_SHA ===')
     post !== undefined &&
       JSON.parse(post.body || '{}').data?.attributes?.['commit-sha'] === EXPLICIT,
     post ? post.body.slice(0, 300) : '(no POST was issued)',
+  )
+}
+
+// --------------------------------------------------------------------------
+// The upload-driven publish, end to end through the bundle.
+//
+// This is the half of the HCP flow that `npm test` cannot reach: the archive is
+// built from a REAL directory on disk by code wired up in src/index.ts, which
+// the unit suite does not import at all. A branch-based module answers version
+// creation with an upload link, and the action must then PUT a real gzipped tar
+// of that directory — the version is otherwise left at 'pending' forever.
+// --------------------------------------------------------------------------
+console.log('\n=== HCP upload-driven: the module archive is built and uploaded ===')
+{
+  const moduleDir = mkdtempSync(join(work, 'module-'))
+  writeFileSync(join(moduleDir, 'main.tf'), 'resource "null_resource" "a" {}\n')
+  writeFileSync(join(moduleDir, 'variables.tf'), 'variable "name" {}\n')
+  // Excluded from the archive: proof the exclusion survives the bundler.
+  execFileSync('mkdir', ['-p', join(moduleDir, '.git')])
+  writeFileSync(join(moduleDir, '.git', 'config'), 'not module source')
+
+  const CAPABILITY = 'dmF1bHQ6c2VjcmV0LWNhcGFiaWxpdHktdG9rZW4'
+  let uploadLink = ''
+  const reg = await startRegistry((req, res) => {
+    if (req.method === 'GET') {
+      return json(res, 200, { data: { attributes: { 'vcs-repo': { branch: 'main' } } } })
+    }
+    if (req.method === 'POST') return json(res, 201, { data: { links: { upload: uploadLink } } })
+    res.writeHead(200)
+    res.end('')
+  })
+  uploadLink = `${reg.url}/v1/object/${CAPABILITY}`
+  const r = await runAction({
+    'INPUT_REGISTRY-TYPE': 'hcp',
+    'INPUT_HCP-ADDRESS': reg.url,
+    'INPUT_HCP-TOKEN': HCP_TOKEN,
+    'INPUT_VCS-BRANCH': 'main',
+    'INPUT_MODULE-DIRECTORY': moduleDir,
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': '127.0.0.1',
+  })
+  await reg.close()
+
+  const put = reg.requests.find((q) => q.method === 'PUT')
+  check(
+    'the action PUTs the archive to the upload link and reports success',
+    r.code === 0 && put !== undefined && outputValue(r.output, 'published') === 'true',
+    `exit ${r.code}, methods ${JSON.stringify(reg.requests.map((q) => q.method))}; ${errorLine(r)}`,
+  )
+  check(
+    'the upload goes to the exact capability path HCP returned',
+    put?.path === `/v1/object/${CAPABILITY}`,
+    put ? put.path : '(no PUT was issued)',
+  )
+
+  // The bytes are unpacked with the system tar, so this asserts a real reader
+  // accepts what a real consumer would download — not that our writer round
+  // trips its own format.
+  let listed = ''
+  if (put) {
+    const tgz = join(work, 'uploaded.tar.gz')
+    writeFileSync(tgz, Buffer.concat(put.chunks))
+    try {
+      listed = execFileSync('tar', ['-tzf', tgz], { encoding: 'utf8' })
+    } catch (e) {
+      listed = `tar refused the upload: ${e}`
+    }
+  }
+  check(
+    'the uploaded bytes are a gzipped tar the system tar can read',
+    put !== undefined &&
+      Buffer.concat(put.chunks)[0] === 0x1f &&
+      Buffer.concat(put.chunks)[1] === 0x8b &&
+      // The gzip magic alone would pass on an archive whose tar headers are
+      // corrupt, so the reader's verdict is part of the claim.
+      listed !== '' &&
+      !listed.startsWith('tar refused'),
+    put ? `magic ${Buffer.concat(put.chunks).subarray(0, 2).toString('hex')}; tar said: ${listed}` : '(no PUT)',
+  )
+  check(
+    'the archive holds the module files at its root',
+    /^main\.tf$/m.test(listed) && /^variables\.tf$/m.test(listed),
+    listed || '(nothing listed)',
+  )
+  check(
+    'the archive excludes .git, which is not module source',
+    listed !== '' && !/\.git/.test(listed),
+    listed || '(nothing listed)',
+  )
+
+  // The HCP token is org-scoped for registry-modules. The upload host is named
+  // by a RESPONSE BODY, and the capability URL is itself the authorization, so
+  // attaching the token would hand that credential to whatever host answered.
+  check(
+    'the upload does not carry the HCP bearer token',
+    put !== undefined && put.auth === '',
+    put ? `authorization: '${put.auth}'` : '(no PUT)',
+  )
+  check(
+    'the version-creation call still DOES carry it',
+    reg.requests.find((q) => q.method === 'POST')?.auth === `Bearer ${HCP_TOKEN}`,
+    JSON.stringify(reg.requests.map((q) => `${q.method}:${q.auth.slice(0, 12)}`)),
+  )
+
+  // The capability lives in the URL PATH, so masking has to cover the whole URL
+  // rather than the query string a presigned-link redactor would strip.
+  check(
+    '::add-mask:: is emitted for the upload capability URL',
+    r.stdout.includes(`::add-mask::${uploadLink}`),
+    r.stdout.split('\n').filter((l) => l.includes('add-mask')).join(' | ') || '(no mask line)',
+  )
+  const capabilityLines = r.stdout.split('\n').filter((l) => l.includes(CAPABILITY))
+  check(
+    'the capability appears in the log exactly once, in the mask command',
+    capabilityLines.length === 1 && capabilityLines[0] === `::add-mask::${uploadLink}`,
+    capabilityLines.join(' | ') || '(the capability appears nowhere, not even masked)',
+  )
+  check(
+    'the step still names the upload host, so it can be allowlisted',
+    r.stdout.includes('127.0.0.1'),
+    '(the host is never mentioned)',
+  )
+}
+
+// --------------------------------------------------------------------------
+// The upload destination is chosen by a RESPONSE BODY, which is the SSRF shape
+// this family has already been bitten by. It is authorized against
+// registry-allowed-hosts exactly like the API host, before it is contacted.
+// --------------------------------------------------------------------------
+console.log('\n=== an upload link off the allowlist is refused, not followed ===')
+{
+  const reg = await startRegistry((req, res) => {
+    if (req.method === 'GET') {
+      return json(res, 200, { data: { attributes: { 'vcs-repo': { branch: 'main' } } } })
+    }
+    return json(res, 201, { data: { links: { upload: 'https://169.254.169.254/v1/object/steal' } } })
+  })
+  const moduleDir = mkdtempSync(join(work, 'module-ssrf-'))
+  writeFileSync(join(moduleDir, 'main.tf'), 'resource "null_resource" "a" {}\n')
+  const r = await runAction({
+    'INPUT_REGISTRY-TYPE': 'hcp',
+    'INPUT_HCP-ADDRESS': reg.url,
+    'INPUT_HCP-TOKEN': HCP_TOKEN,
+    'INPUT_VCS-BRANCH': 'main',
+    'INPUT_MODULE-DIRECTORY': moduleDir,
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': '127.0.0.1',
+  })
+  await reg.close()
+  // Positive AND negative, per rule 2: the refusal was printed, and the upload
+  // was not attempted against the registry either.
+  check(
+    'the action refuses the off-allowlist upload host by name',
+    r.code !== 0 && /169\.254\.169\.254/.test(errorLine(r)) && /registry-allowed-hosts/.test(errorLine(r)),
+    errorLine(r) || '(no ::error:: on stdout)',
+  )
+  check(
+    'no PUT was issued anywhere',
+    !reg.requests.some((q) => q.method === 'PUT'),
+    JSON.stringify(reg.requests.map((q) => q.method)),
+  )
+  check(
+    "the step is failed rather than reporting a publish",
+    outputValue(r.output, 'published') === undefined,
+    JSON.stringify(r.output),
+  )
+}
+
+// --------------------------------------------------------------------------
+// A mis-pointed module-directory publishes the wrong thing. It is refused
+// before the version is created, not after the archive is uploaded.
+// --------------------------------------------------------------------------
+console.log('\n=== a module-directory holding no Terraform is refused ===')
+{
+  const notAModule = mkdtempSync(join(work, 'notmodule-'))
+  writeFileSync(join(notAModule, 'README.md'), 'no terraform here')
+  let uploadLink = ''
+  const reg = await startRegistry((req, res) => {
+    if (req.method === 'GET') {
+      return json(res, 200, { data: { attributes: { 'vcs-repo': { branch: 'main' } } } })
+    }
+    if (req.method === 'POST') return json(res, 201, { data: { links: { upload: uploadLink } } })
+    res.writeHead(200)
+    res.end('')
+  })
+  uploadLink = `${reg.url}/v1/object/cap`
+  const r = await runAction({
+    'INPUT_REGISTRY-TYPE': 'hcp',
+    'INPUT_HCP-ADDRESS': reg.url,
+    'INPUT_HCP-TOKEN': HCP_TOKEN,
+    'INPUT_VCS-BRANCH': 'main',
+    'INPUT_MODULE-DIRECTORY': notAModule,
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': '127.0.0.1',
+  })
+  await reg.close()
+  check(
+    'the failure says the directory holds no .tf files',
+    r.code !== 0 && /no \.tf or \.tf\.json files/.test(errorLine(r)),
+    errorLine(r) || '(no ::error:: on stdout)',
+  )
+  check(
+    'nothing was uploaded',
+    !reg.requests.some((q) => q.method === 'PUT'),
+    JSON.stringify(reg.requests.map((q) => q.method)),
   )
 }
 

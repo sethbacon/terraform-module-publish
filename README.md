@@ -10,11 +10,12 @@ consumers alike.
 
 - **private** — resolves the (already SCM-linked) module and triggers the
   registry's tag-sync so the freshly-pushed git tag is imported as a new version.
-- **hcp** — checks the module (creating a tag-based VCS module if missing) so
-  HCP imports the pushed tag as a version, optionally waiting until it is ready.
-  See [HCP publishing modes](#hcp-publishing-modes) — this action does not
-  upload module archives, and it fails rather than report a version HCP is
-  holding at `pending`.
+- **hcp** — checks the module (creating a tag-based VCS module if missing) and
+  completes the publish the way that module's class of version requires: HCP
+  imports the pushed tag, or — for a branch-based or VCS-less module — the
+  action creates the version and uploads the module archive HCP is waiting for.
+  Optionally waits until the version is ready. See
+  [HCP publishing modes](#hcp-publishing-modes).
 
 ## Inputs
 
@@ -29,7 +30,8 @@ consumers alike.
 | `hcp-address` | `https://app.terraform.io` | HCP/TFE base URL |
 | `hcp-token` | `""` | HCP/TFE API token (**required** for `hcp`) — needs `registry-modules` write, see [Token scope and host trust](#token-scope-and-host-trust) |
 | `vcs-repo-identifier` / `vcs-oauth-token-id` | `""` | used to create an HCP module if missing |
-| `vcs-branch` | `""` | empty creates a **tag-based** module; a branch creates one whose versions need an archive upload (see [HCP publishing modes](#hcp-publishing-modes)) |
+| `vcs-branch` | `""` | empty creates a **tag-based** module; a branch creates one whose versions are completed by an archive upload (see [HCP publishing modes](#hcp-publishing-modes)) |
+| `module-directory` | `"."` | module source archived and uploaded when HCP asks for content; its contents land at the archive root (see [HCP publishing modes](#hcp-publishing-modes)) |
 | `commit-sha` | `$GITHUB_SHA` | commit recorded on the new HCP version; defaults to the commit the workflow ran on (see [Version provenance](#version-provenance)) |
 | `wait-for-publish` | `false` | wait until the version is available/ready |
 | `timeout-seconds` | `180` | wait timeout, in whole seconds. A value that is not a positive whole number is **rejected with a warning** and the default used — it is not silently truncated. Use `wait-for-publish: false` to not wait at all |
@@ -141,23 +143,63 @@ on the runner works too, if you prefer to trust the CA process-wide.
 
 ## HCP publishing modes
 
-HCP Terraform fills in a module's versions one of two ways, and only one of them
-is something a CI action can complete on its own:
+HCP Terraform fills in a module's versions one of two ways, and the action
+detects which from HCP's own description of the module rather than guessing from
+your inputs:
 
 - **Tag-based** (`vcs-branch` empty — the default, and what this action creates).
-  HCP imports every pushed git tag as a version by itself. This action ensures
-  the module exists and, with `wait-for-publish: true`, waits for the version to
-  become ready.
+  HCP imports every pushed git tag as a version by itself. There is no version
+  for this action to create and nothing to upload: it ensures the module exists
+  and, with `wait-for-publish: true`, waits for the version to become ready.
 - **Branch-based** (`vcs-branch` set) **or no VCS repo at all.** The version is
-  created through the API and then sits at status `pending` until a gzipped
-  module archive is uploaded to the URL HCP returns. **This action does not
-  upload module content.** When HCP answers that an upload is required, the step
-  **fails** rather than reporting a publish that has not happened. Either leave
-  `vcs-branch` empty so HCP imports the pushed tag, or perform the archive
-  upload yourself.
+  created through the API and sits at status `pending` until a gzipped module
+  archive is uploaded to the URL HCP returns with it. The action builds that
+  archive from `module-directory` and uploads it, so the version reaches `ok`
+  rather than being left pending.
 
 Because it is the workflow's tag push that produces a tag-based version, run
 this action on the tag (the first example below).
+
+### The uploaded archive
+
+`module-directory` (default `.`) is the module root. Its **contents** land at
+the archive root, so `module-directory/main.tf` becomes `main.tf` — which is
+where HCP looks. `.git` and `.terraform` are excluded; everything else under it
+is included.
+
+The archive is byte-reproducible: file modes, uid/gid and mtimes are pinned to
+constants and entries are sorted, so identical module content always produces an
+identical archive regardless of the runner's clock or umask.
+
+Four things are refused rather than published:
+
+- a `module-directory` with no `.tf`/`.tf.json` files **at its root** — that is
+  a mis-pointed path, not a module;
+- a symlink resolving **outside** `module-directory`. This archive is uploaded
+  and, for a public module, published, so following a link into the runner's
+  filesystem would turn the publish step into an exfiltration primitive;
+- a symlink to a directory, or a broken one, rather than silently dropping it;
+- a tree over 64 MiB uncompressed, which is a mis-pointed path far more often
+  than it is a module.
+
+### Upload host trust
+
+The upload URL comes from HCP's **response body**, and it is a bearer
+capability — anything holding it can write that object. Two consequences:
+
+- The URL is registered with the job's secret mask **before** it is used, and is
+  never logged; only its host is printed, so you can see where the archive went.
+  The whole URL is masked, not just its query string, because HCP's archivist
+  capability is in the URL **path**.
+- The upload host is authorized against `registry-allowed-hosts` exactly like
+  the API host, on the initial request and on every redirect hop. **If you set
+  `registry-allowed-hosts`, add the upload host too** — `archivist.terraform.io`
+  for HCP Terraform; for Terraform Enterprise it is your TFE host or whatever
+  object store it fronts. Otherwise the upload is refused by name.
+
+The HCP token is **not** sent to the upload host: the capability URL is itself
+the authorization, and the token is an org-scoped `registry-modules` credential
+that has no business going to a host named by a response body.
 
 The host-authorization primitives come from
 [`@4cloudguru/pipeline-task-core`](https://www.npmjs.com/package/@4cloudguru/pipeline-task-core),

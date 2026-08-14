@@ -1,3 +1,6 @@
+import { extractUrlTokenSecrets, redactUrl, scrubSecretsFromMessage } from '@4cloudguru/pipeline-task-core';
+import { URL } from 'url';
+import { createModuleArchive } from './archive';
 import { HttpClient, httpError, parseJson, pollUntil, trimTrailingSlash } from './http';
 import { ModuleCoordinates, PublishResult, RegistryPublisher } from './types';
 
@@ -11,6 +14,8 @@ export interface HcpOptions extends ModuleCoordinates {
     commitSha: string;
     waitForPublish: boolean;
     timeoutSeconds: number;
+    /** Module root archived and uploaded for an upload-driven version. */
+    moduleDirectory: string;
 }
 
 interface VersionStatus {
@@ -100,20 +105,40 @@ export function publishMode(body: string): PublishMode {
 }
 
 /**
- * True when HCP answered a version creation with an archive-upload URL, which
- * is HCP stating that the version it just created is `pending` and stays that
- * way until module content is PUT to that URL.
+ * The archive-upload URL HCP answered a version creation with, if any.
+ *
+ * Its presence is HCP stating that the version it just created is `pending` and
+ * stays that way until module content is PUT to that URL. Only an https URL is
+ * returned: the response body is chosen by whatever host `hcp-address` names,
+ * and this value becomes a request destination carrying the module's source, so
+ * a `http://` or `file:` spelling is refused here rather than handed to the
+ * client. Host authorization happens separately, in the client, on this URL and
+ * on every redirect off it.
  */
-export function requiresContentUpload(body: string): boolean {
+export function uploadUrl(body: string): string | undefined {
+    let raw: string | undefined;
     try {
-        return Boolean(
-            parseJson<HcpVersionResponse>(body, 'The HCP Terraform version response').data?.links
-                ?.upload,
-        );
+        raw = parseJson<HcpVersionResponse>(body, 'The HCP Terraform version response').data?.links?.upload;
     } catch {
         // A body that is not JSON cannot be asserting an upload requirement.
-        return false;
+        return undefined;
     }
+    if (!raw) return undefined;
+    let parsed: URL;
+    try {
+        parsed = new URL(raw);
+    } catch {
+        throw new Error('HCP Terraform returned a module-archive upload link that is not a valid URL.');
+    }
+    if (parsed.protocol !== 'https:') {
+        // The URL itself is not echoed: it is a bearer capability to write that
+        // object, and the scheme is the whole of what the operator needs.
+        throw new Error(
+            `Refusing to upload the module archive: HCP Terraform returned an upload link with scheme ` +
+                `'${parsed.protocol}', and the archive is only ever sent over https.`,
+        );
+    }
+    return raw;
 }
 
 /**
@@ -156,7 +181,10 @@ export function versionBody(version: string, commitSha: string): string {
 
 /**
  * Publishes a module version to HCP Terraform: checks the module, creates a VCS-connected module
- * if it does not exist, creates the version, and (optionally) waits for it to become ready.
+ * if it does not exist, then completes the publish the way that module's own class of version
+ * requires — observing the tag import for a tag-based module, or creating the version and
+ * uploading the module archive for an upload-driven one — and (optionally) waits for it to
+ * become ready.
  */
 export class HcpPublisher implements RegistryPublisher {
     constructor(
@@ -170,6 +198,18 @@ export class HcpPublisher implements RegistryPublisher {
          * bounded, control-character-stripped excerpt.
          */
         private readonly debug: (message: string) => void = () => {},
+        /**
+         * Registers a value with the job's secret mask. Wired to
+         * `core.setSecret`; called on the archive-upload URL BEFORE that URL is
+         * used for anything, because the mask is applied to output as it is
+         * written and cannot be applied retroactively to a line already logged.
+         */
+        private readonly maskSecret: (secret: string) => void = () => {},
+        /**
+         * Builds the module archive. Injectable so the flow tests above stay
+         * hermetic; the default reads the real `module-directory`.
+         */
+        private readonly createArchive?: () => Promise<Uint8Array>,
     ) {}
 
     async publish(): Promise<PublishResult> {
@@ -241,36 +281,97 @@ export class HcpPublisher implements RegistryPublisher {
 
     /**
      * Branch-based or no-VCS module: the version is created through the API and
-     * stays at status `pending` until a gzipped module archive is uploaded.
-     * This action has no module content to send, so a version HCP reports as
-     * upload-pending fails the step instead of being announced as published.
+     * stays at status `pending` until a gzipped module archive is PUT to the
+     * `links.upload` URL the creation returned. Both halves happen here — a
+     * version created and left without content is a version consumers can
+     * resolve and cannot use, so the upload is part of the publish rather than
+     * something left to the caller.
      */
     private async publishUploadDriven(headers: Record<string, string>): Promise<PublishResult> {
         const o = this.options;
+        let uploaded = false;
         const versionResp = await this.http('POST', versionsUrl(o), headers, versionBody(o.version, o.commitSha));
         if (versionResp.status === 422) {
             this.log(`Version ${o.version} already exists.`);
         } else if (versionResp.status < 200 || versionResp.status >= 300) {
             throw httpError('create version', versionResp, this.debug);
-        } else if (requiresContentUpload(versionResp.body)) {
-            // The upload URL HCP returned is deliberately NOT echoed: it is a
-            // bearer capability to write that object, and step logs are not the
-            // place for one.
-            throw new Error(
-                `Version ${o.version} was created but HCP Terraform holds it at status 'pending' until a module ` +
-                    'archive is uploaded, and this action does not upload module content. Publish tag-based ' +
-                    "instead by leaving 'vcs-branch' empty, so HCP imports the version from the pushed git tag; " +
-                    'or upload the archive yourself using the upload URL from the versions API. See the HCP ' +
-                    'section of the action README.',
-            );
         } else {
-            this.log(`Version ${o.version} created.`);
+            const upload = uploadUrl(versionResp.body);
+            if (upload) {
+                await this.uploadArchive(upload);
+                uploaded = true;
+            } else {
+                this.log(`Version ${o.version} created.`);
+            }
         }
 
         if (o.waitForPublish && !(await this.waitForOk(headers))) {
             throw new Error(`Timed out after ${o.timeoutSeconds}s waiting for version ${o.version} to become ready.`);
         }
-        return { published: true, message: `Version ${o.version} published to HCP Terraform.` };
+        return {
+            published: true,
+            message: uploaded
+                ? `Version ${o.version} published to HCP Terraform with the module archive uploaded.`
+                : `Version ${o.version} published to HCP Terraform.`,
+        };
+    }
+
+    /**
+     * PUTs the module archive to the capability URL HCP just issued.
+     *
+     * Three things about this request differ from every other one this class
+     * makes, and each is deliberate:
+     *
+     *  - The URL is masked BEFORE it is used. The archivist capability lives in
+     *    the URL's PATH, not its query, so neither `redactUrl` (which drops only
+     *    the query) nor `extractUrlTokenSecrets` covers it — the whole URL is
+     *    registered with the mask, and the query-string tokens are registered
+     *    too for a TFE install whose upload link is a presigned object-store URL.
+     *    Nothing logs the URL; the host alone is what an operator needs to see.
+     *  - The HCP bearer token is NOT sent. The upload host is a different host
+     *    from the API (`archivist.terraform.io` for HCP), and the URL already
+     *    carries its own authorization, so attaching the token would hand an
+     *    org-scoped `registry-modules` credential to a host named by a response
+     *    body.
+     *  - The request goes through the same client as every other call, so the
+     *    upload host is authorized against `registry-allowed-hosts` — and so is
+     *    every redirect hop off it — rather than being contacted because a
+     *    response body named it.
+     */
+    private async uploadArchive(url: string): Promise<void> {
+        const tokens = extractUrlTokenSecrets(url);
+        this.maskSecret(url);
+        for (const token of tokens) this.maskSecret(token);
+
+        const archive = await (this.createArchive
+            ? this.createArchive()
+            : createModuleArchive(this.options.moduleDirectory));
+
+        this.log(
+            `Uploading the ${archive.byteLength}-byte module archive for version ${this.options.version} to ` +
+                `${new URL(url).host}.`,
+        );
+        const resp = await this.http('PUT', url, { 'Content-Type': 'application/octet-stream' }, archive);
+        if (resp.status < 200 || resp.status >= 300) {
+            // Scrubbed, because the failure body comes from the upload host and
+            // an object store that echoes the request URL back in its error
+            // would otherwise put the capability into the job annotation.
+            //
+            // `redactUrl(url)` is passed as a secret in its own right:
+            // `scrubSecretsFromMessage` rewrites the URL to that form, which
+            // drops the QUERY only — the right redaction for a presigned
+            // object-store link, but the archivist capability lives in the
+            // PATH, so the rewritten form is still the capability. Both
+            // spellings are redacted outright.
+            throw new Error(
+                scrubSecretsFromMessage(httpError('upload the module archive', resp, this.debug).message, url, [
+                    url,
+                    redactUrl(url),
+                    ...tokens,
+                ]),
+            );
+        }
+        this.log(`Module archive uploaded for version ${this.options.version}.`);
     }
 
     private waitForOk(headers: Record<string, string>): Promise<boolean> {
