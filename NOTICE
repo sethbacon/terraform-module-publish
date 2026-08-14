@@ -4,7 +4,7 @@ Copyright 2026 Seth T. Bacon
 This product is licensed under the Apache License, Version 2.0.
 See the LICENSE file for the full license text.
 
-dist/index.js is a single-file @vercel/ncc bundle: the whole runtime dependency
+dist/index.js is a single-file esbuild bundle: the whole runtime dependency
 tree is inlined into it with no package boundaries, so this list is the only
 human-readable inventory of what a consumer executes. An earlier revision named
 one package while the bundle in fact carried a full HTTP stack; the entries
@@ -18,8 +18,10 @@ strings present in the built bundle.
   @actions/io                           MIT
   tunnel                                MIT
   undici                                MIT
-    includes formdata-polyfill          MIT  (vendored by undici; its banner
-                                             appears verbatim in dist/index.js)
+    includes formdata-polyfill          MIT  (vendored by undici; both banners
+    includes ws                         MIT   are reproduced verbatim in the
+                                              "Bundled license information"
+                                              block at the end of the bundle)
 
 A machine-readable CycloneDX SBOM is generated at release time and attached to
 each GitHub Release, alongside a build-provenance attestation over dist/index.js.

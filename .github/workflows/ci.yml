@@ -27,12 +27,13 @@ jobs:
       # them onto one red step is exactly what made a mechanical dependency bump
       # read as a broken pull request and sit for a week.
       #
-      # `npm run build` ends in scripts/verify-bundle.mjs, so a bundle carrying
-      # an unresolved-module stub fails HERE and never reaches the diff below.
-      # That ordering is load-bearing: the staleness gate compares dist/ to a
-      # fresh build OF ITSELF, so it cannot tell a good bundle from a dead one,
-      # and "rebuild and commit" would otherwise be sound advice that ships a
-      # bundle throwing MODULE_NOT_FOUND at every consumer.
+      # `npm run build` is `npm run lint`, then esbuild, then
+      # scripts/verify-bundle.mjs — so a bundle that would not compile, or that
+      # still resolves a module at run time, fails HERE and never reaches the
+      # diff below. That ordering is load-bearing: the staleness gate compares
+      # dist/ to a fresh build OF ITSELF, so it cannot tell a good bundle from a
+      # dead one, and "rebuild and commit" would otherwise be sound advice that
+      # ships a bundle throwing MODULE_NOT_FOUND at every consumer.
       - name: Rebuild the bundle
         id: rebuild
         run: npm run build
@@ -46,12 +47,13 @@ jobs:
       #
       # The staleness gate is not cover for this and never was: it compares
       # dist/index.js to a fresh build OF ITSELF, so a bundle that throws at
-      # require time passes it byte-for-byte. `@vercel/ncc` 0.38.4 failed loudly
-      # when it could not bundle a dependency; 0.44.1 exits 0 and emits a
-      # `webpackMissingModule` stub in its place. Lint, tests and dist-sync all
-      # stay green while every consumer of `uses: ...@v1` fails before a line of
-      # the action runs. This step is the only one here that executes the
-      # artifact consumers execute.
+      # require time passes it byte-for-byte. esbuild fails loudly on a
+      # top-level import it cannot resolve, but not on a dependency dropped by
+      # `--external`, a `require()` inside a try/catch, or a computed specifier
+      # — each exits 0 and writes a bundle that resolves a module at run time.
+      # Lint, tests and dist-sync all stay green while every consumer of
+      # `uses: ...@v1` fails before a line of the action runs. This step is the
+      # only one here that executes the artifact consumers execute.
       - name: Execute the built bundle and assert its guards
         run: npm run test:dist
 
@@ -111,7 +113,7 @@ jobs:
           REBUILD: ${{ steps.rebuild.outcome }}
         run: |
           if [ "$REBUILD" = "failure" ]; then
-            echo "::error::This bump does not merely need a rebuild — the bundle cannot be built from it. Either the TypeScript compile failed or the bundler could not resolve a dependency and emitted a throwing stub (see the 'Rebuild the bundle' step above for which). Committing a rebuilt dist/ here would ship an action that fails before it runs. Close the PR or pin the dependency until upstream is fixed."
+            echo "::error::This bump does not merely need a rebuild — the bundle cannot be built from it. Either the TypeScript compile failed, or esbuild could not resolve a dependency, or the built bundle still resolves one at run time and would die with MODULE_NOT_FOUND (see the 'Rebuild the bundle' step above for which). Committing a rebuilt dist/ here would ship an action that fails before it runs. Close the PR or pin the dependency until upstream is fixed."
           else
             echo "::notice::This bump builds cleanly and the rebuilt bundle passed verification — the only thing missing is the committed dist/. To land it: git fetch origin \"$HEAD_REF\" && git switch \"$HEAD_REF\" && npm ci && npm run build && git commit -am 'build: rebuild dist for this dependency bump' && git push"
           fi

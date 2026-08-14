@@ -7,7 +7,7 @@ name: Release
 # The gap this closes: CI fired only on push/pull_request to main, so a tag
 # could be created at any commit — including one whose dist/index.js was never
 # rebuilt or verified — and consumers resolving `@v1` would execute it. What a
-# consumer runs is a ~500 KB minified, sourcemap-free ncc bundle that no human
+# consumer runs is a ~440 KB minified, sourcemap-free esbuild bundle no human
 # will ever diff, so the dist-sync gate has to hold at the tag, not just on main.
 "on":
   push:
