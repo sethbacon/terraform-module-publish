@@ -79,9 +79,15 @@ jobs:
       - run: npm run build
 
       - name: Fail if the committed bundle has drifted
+        # Staged-then-diffed over the whole directory, matching ci.yml and the
+        # sibling action: a plain `git diff` compares TRACKED content only, so a
+        # file the build newly emits into dist/ is invisible to it and this gate
+        # would certify a bundle whose companion chunk was never committed.
+        # --force covers a path a .gitignore rule would otherwise hide.
         run: |
-          if ! git diff --exit-code -- dist/index.js; then
-            echo "::error::dist/index.js no longer matches a build of the current lockfile. A bundled dependency changed without the bundle being rebuilt — check out main, run 'npm run build', and commit dist/index.js."
+          git add --force -A -- dist
+          if ! git diff --cached --exit-code -- dist; then
+            echo "::error::dist/ no longer matches a build of the current lockfile. A bundled dependency changed without the bundle being rebuilt — check out main, run 'npm run build', and commit dist/."
             exit 1
           fi
 

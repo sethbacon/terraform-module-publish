@@ -2,12 +2,17 @@
 version: 2
 
 updates:
-  # npm. Note the standing friction, documented in ci.yml's dist-sync step: this
-  # action commits its ncc bundle, so any update to a BUNDLED dependency makes
-  # dist/index.js stale and the PR red by construction — Dependabot edits the
-  # manifests but never runs the build. The dist-sync step prints an actionable
-  # message naming that when the actor is dependabot[bot]; the branch still has
-  # to be checked out, rebuilt and pushed by a human.
+  # npm. Note the standing friction, documented under "Rebuilding dist/" in
+  # README.md: this action commits its ncc bundle, so any update to a BUNDLED
+  # dependency makes dist/ stale and the PR red by construction — Dependabot
+  # edits the manifests but never runs the build. ci.yml's "What to do about
+  # this Dependabot bump" step separates the two cases in the failing run's log:
+  # a bump that builds cleanly and only needs the bundle committed, and a bump
+  # the bundle cannot be built from at all (a dependency gone ESM-only makes
+  # `ncc` emit a throwing stub while still exiting 0). The first is four
+  # commands for a human; the second must not be "fixed" by committing a
+  # rebuild. Nothing rebuilds and pushes on Dependabot's behalf, and README.md
+  # says why.
   - package-ecosystem: npm
     directory: /
     schedule:

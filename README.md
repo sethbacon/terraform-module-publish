@@ -274,6 +274,54 @@ publishing workflow on a tag push, and prevent tags from being force-moved.
     version: 1.2.3
 ```
 
+## Rebuilding `dist/`
+
+`dist/` is committed, because GitHub Actions execute the bundled output rather
+than the source. That has one standing consequence: **Dependabot cannot open a
+mergeable bundled-dependency bump.** It edits `package.json` and the lockfile
+and never runs a build, so the committed bundle no longer matches its lockfile
+and both dist gates go red by construction. This is expected, not a broken PR.
+
+CI says which of two situations it is, in the failing run's log:
+
+- **"This bump builds cleanly …"** — mechanical. Rebuild and push:
+
+  ```bash
+  git fetch origin <dependabot-branch>
+  git switch <dependabot-branch>
+  npm ci && npm run build
+  git commit -am 'build: rebuild dist for this dependency bump'
+  git push
+  ```
+
+- **"This bump does not merely need a rebuild …"** — the bundle cannot be built
+  from that dependency set at all. **Do not commit a rebuilt `dist/`.** Either
+  `tsc` fails, or the bundler could not resolve a dependency. `@vercel/ncc`
+  0.44.1 does not fail that build: it exits 0 and writes a `webpackMissingModule`
+  stub in place of the import, producing a bundle that throws `MODULE_NOT_FOUND`
+  before the action's first line. `npm run build` therefore ends in
+  `scripts/verify-bundle.mjs`, which refuses to certify such a bundle — the
+  staleness gates cannot, since they compare `dist/` to a fresh build *of
+  itself* and a committed stub matches its own rebuild exactly.
+
+### Why no bot pushes the rebuild
+
+The common recipe is a workflow that rebuilds `dist/` and pushes to the PR
+branch, usually written as `pull_request_target` with `contents: write`. That
+runs the pull request's own code — including any build-time script a new
+lockfile pulls in — with a writable token against this repository. On an action
+whose threat model is untrusted input reaching a privileged context, it is worse
+than the friction it removes, so it is not done here.
+
+The safe shape (build unprivileged, commit the bytes from a trusted ref) does
+not help either, for a mechanical reason: a push authored by `GITHUB_TOKEN`
+creates no `pull_request` event, and `Conventional PR Title` — a required check
+— is produced only by that event. An auto-pushed commit would move the PR head
+to a commit where a required check can never appear, turning an actionably red
+PR into a permanently unmergeable one. Making it work needs a write-capable
+credential in both the Actions **and** Dependabot secret stores; that is a
+larger blast radius than the four commands above.
+
 ## Pinning this action
 
 The examples above use `@v1` for readability. **`v1` is a mutable tag** — this
