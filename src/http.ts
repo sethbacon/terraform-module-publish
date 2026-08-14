@@ -203,3 +203,63 @@ export function parseJson<T>(body: string, what: string): T {
 export function delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+/**
+ * The one place a failed HTTP response becomes an Error.
+ *
+ * Four call sites across the two publishers hand-wrote the identical
+ * `Failed to <action> (HTTP <status>): <body>` template. That is where the
+ * registry-controlled body reaches `core.setFailed`, so every hardening of how
+ * a remote body is surfaced — bounding it, stripping control characters,
+ * whatever comes next — had to be applied four times and was easy to apply to
+ * three. It is applied once now, and `debug` carries the FULL body to the
+ * `ACTIONS_STEP_DEBUG` channel so nothing is lost, only bounded.
+ */
+export function httpError(
+    action: string,
+    resp: HttpResponse,
+    debug: (message: string) => void = () => {},
+): Error {
+    debug(`${action} response body: ${resp.body}`);
+    return new Error(`Failed to ${action} (HTTP ${resp.status}): ${bodyExcerpt(resp.body)}`);
+}
+
+/** Strips every trailing slash from a base URL. */
+export function trimTrailingSlash(url: string): string {
+    return url.replace(/\/+$/, '');
+}
+
+/**
+ * Polls `check` until it returns true or the deadline passes.
+ *
+ * Both publishers had this loop written out separately — same skeleton, same
+ * 3-second interval, differing only in which URL they fetched and which
+ * predicate they applied — so the errors domain's observation that the deadline
+ * is checked AFTER the request (a hung request outlives the timeout; the
+ * per-request timeout in the shared client is what actually bounds that) held
+ * in two places and any fix had to land in two places.
+ *
+ * A transient failure mid-poll is not fatal. By the time this runs the side
+ * effect that matters has already succeeded — the sync is triggered, or the
+ * version is created — so letting one DNS blip or one 502 abort the wait
+ * reports total failure for a publish that worked. Failures are retried until
+ * the deadline and the last one is surfaced only if the deadline is reached.
+ */
+export async function pollUntil(
+    check: () => Promise<boolean>,
+    timeoutSeconds: number,
+    onTransient: (message: string) => void = () => {},
+    intervalMs = 3000,
+): Promise<boolean> {
+    const deadline = Date.now() + timeoutSeconds * 1000;
+    for (;;) {
+        try {
+            if (await check()) return true;
+        } catch (error) {
+            if (Date.now() >= deadline) return false;
+            onTransient(`Poll attempt failed, retrying until the deadline: ${describeError(error)}`);
+        }
+        if (Date.now() >= deadline) return false;
+        await delay(intervalMs);
+    }
+}

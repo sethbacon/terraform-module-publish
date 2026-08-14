@@ -22,25 +22,57 @@ consumers alike.
 |-------|---------|-------|
 | `registry-type` | — (required) | `private` or `hcp` |
 | `namespace` / `name` / `provider` / `version` | — (required) | module coordinates |
-| `registry-url` | `""` | private registry base URL (required for `private`) |
-| `api-key` | `""` | private registry Bearer key (required for `private`) |
+| `registry-url` | `""` | private registry base URL (**required** for `private`) — see [Token scope and host trust](#token-scope-and-host-trust) |
+| `api-key` | `""` | private registry Bearer key (**required** for `private`) — must be **admin-capable**, see [Token scope and host trust](#token-scope-and-host-trust) |
 | `ca-cert` | `""` | PEM CA certificate for a registry behind a private CA (see [Private CAs](#private-cas)) |
 | `skip-tls-verify` | — | **removed**; setting it fails the step (see [Private CAs](#private-cas)) |
 | `hcp-address` | `https://app.terraform.io` | HCP/TFE base URL |
-| `hcp-token` | `""` | HCP/TFE API token (required for `hcp`) |
+| `hcp-token` | `""` | HCP/TFE API token (**required** for `hcp`) — needs `registry-modules` write, see [Token scope and host trust](#token-scope-and-host-trust) |
 | `vcs-repo-identifier` / `vcs-oauth-token-id` | `""` | used to create an HCP module if missing |
 | `vcs-branch` | `""` | empty creates a **tag-based** module; a branch creates one whose versions need an archive upload (see [HCP publishing modes](#hcp-publishing-modes)) |
 | `commit-sha` | `$GITHUB_SHA` | commit recorded on the new HCP version; defaults to the commit the workflow ran on (see [Version provenance](#version-provenance)) |
 | `wait-for-publish` | `false` | wait until the version is available/ready |
-| `timeout-seconds` | `180` | wait timeout |
+| `timeout-seconds` | `180` | wait timeout, in whole seconds. A value that is not a positive whole number is **rejected with a warning** and the default used — it is not silently truncated. Use `wait-for-publish: false` to not wait at all |
 | `registry-allowed-hosts` | `""` | hosts the registry requests may reach (see [Registry egress](#registry-egress)) |
 
 ## Outputs
 
 | Output | Notes |
 |--------|-------|
-| `published` | `"true"` if published / sync triggered, `"false"` if it already existed |
+| `published` | `"true"` when this run created something; `"false"` when the version already existed |
 | `message` | human-readable status |
+
+`registry-url`, `api-key` and `hcp-token` are declared `required: false` in the
+manifest because the Actions schema has no conditional-required construct — each
+is required for exactly one `registry-type`. The check happens at run time, and
+the error names the type that needed it.
+
+**Neither output is set when the step fails.** Both `core.setOutput` calls are
+on the success path, so with `continue-on-error: true` a later step reads the
+empty string, not `"false"` — and an empty string cannot be told apart from a
+step that has not run. Detect failure with the step's own
+`steps.<id>.outcome`/`conclusion`, never by inspecting these.
+
+## Token scope and host trust
+
+**`api-key` must be admin-capable.** The private publish flow's second request
+is `POST /api/v1/admin/modules/{id}/scm/sync`, so a narrowly-scoped
+"publish this module" key will 403. There is no narrower scope that works today,
+which means the credential in your repository secrets reaches every module in
+that registry — provision it with a rotation schedule, and prefer an environment
+with required reviewers on the workflow that uses it.
+
+**`hcp-token` needs `registry-modules` write access** on the organization. Use a
+team token scoped to the organization rather than a personal user token, so
+revoking it does not depend on one person's account.
+
+**`registry-url` and `hcp-address` are not validated against an allowlist by
+default.** Any host that is not private, link-local or otherwise reserved is
+accepted, and the request carries the Bearer credential to it. Hardcode them to
+a known-good registry rather than templating them from a matrix value, another
+job's output, or anything a lower-trust input can reach — and set
+`registry-allowed-hosts` when you want the guarantee enforced rather than
+assumed. See [Registry egress](#registry-egress).
 
 ## Registry egress
 
