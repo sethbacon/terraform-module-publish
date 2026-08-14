@@ -85,6 +85,7 @@ jobs:
     name: Publish release + provenance
     needs: verify
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write # create the GitHub release
       id-token: write # provenance signing
