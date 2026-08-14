@@ -1,0 +1,121 @@
+# Live HCP Terraform publish, run by hand.
+#
+# Deliberately `workflow_dispatch` only. This is the one check that cannot be
+# mocked: every other test in this repo proves the action's behaviour against a
+# local HTTP peer, which by construction cannot answer "does HCP accept this
+# tarball?". Nothing else here can tell a well-formed archive from one HCP
+# rejects, or a Content-Type the presigned link actually signed for from one it
+# 403s on.
+#
+# It is NOT wired to push or pull_request, and should not be:
+#   - it needs a long-lived HCP token, so PR-gating widens the blast radius to
+#     every fork and every dependency bump;
+#   - it publishes a REAL module version into a REAL organization, and registry
+#     versions are immutable, so a per-PR run accumulates junk that cannot be
+#     overwritten, only deleted;
+#   - it makes an external service a merge blocker, and an HCP outage would then
+#     read as "this pull request is broken".
+#
+# Run it before a release, or after touching src/archive.ts or the upload path
+# in src/hcp-publisher.ts. Those are the two places that can break the answer.
+#
+# It runs the COMMITTED dist/ via `uses: ./`, not a fresh build, because the
+# committed bundle is what consumers execute. Proving a rebuilt bundle works
+# would leave the shipped one unverified.
+name: HCP smoke (manual)
+on:
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: HCP organization / module namespace.
+        required: true
+      name:
+        description: Module name (NOT the terraform-<provider>-<name> repo form).
+        required: true
+        default: test-module
+      provider:
+        description: Module provider / target system.
+        required: true
+        default: aws
+      version:
+        description: >-
+          Version to publish. Registry versions are immutable, so a retry needs
+          a new one -- bump the patch rather than reusing a burnt version.
+        required: true
+        default: 0.0.1
+      hcp-address:
+        description: HCP Terraform / TFE base URL.
+        required: true
+        default: https://app.terraform.io
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish a throwaway module version to HCP
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A module directory with real content, so the archive under test is not
+      # a degenerate one-file tar. Written here rather than committed: a stray
+      # *.tf at the repo root confuses tooling that scans for Terraform.
+      - name: Lay down a minimal module to publish
+        run: |
+          mkdir -p smoke-module
+          cat > smoke-module/main.tf <<'TF'
+          # Published by .github/workflows/hcp-smoke.yml to verify the upload
+          # path end to end. Safe to delete along with the module version.
+          variable "name" {
+            type        = string
+            description = "Unused. Present so the module has a real variable."
+            default     = "smoke"
+          }
+
+          output "name" {
+            value       = var.name
+            description = "Echoes the input."
+          }
+          TF
+          cat > smoke-module/README.md <<'MD'
+          # smoke module
+
+          Throwaway module used to verify `terraform-module-publish` against a
+          live HCP Terraform registry. Not intended for use.
+          MD
+
+      - name: Publish
+        id: publish
+        uses: ./
+        with:
+          registry-type: hcp
+          hcp-address: ${{ inputs.hcp-address }}
+          hcp-token: ${{ secrets.HCP_SMOKE_TOKEN }}
+          namespace: ${{ inputs.namespace }}
+          name: ${{ inputs.name }}
+          provider: ${{ inputs.provider }}
+          version: ${{ inputs.version }}
+          module-directory: smoke-module
+
+      # The point of the run. `published` distinguishes "the API accepted our
+      # calls" from "the version actually reached a usable state" -- the whole
+      # reason this workflow exists is that a version sits at `pending` until
+      # the tarball lands, and a mocked test cannot tell the difference.
+      - name: Report what HCP concluded
+        env:
+          PUBLISHED: ${{ steps.publish.outputs.published }}
+          VERSION: ${{ inputs.version }}
+          MODULE: ${{ inputs.namespace }}/${{ inputs.name }}/${{ inputs.provider }}
+        run: |
+          echo "module:    $MODULE"
+          echo "version:   $VERSION"
+          echo "published: $PUBLISHED"
+          if [ "$PUBLISHED" != "true" ]; then
+            echo "::error::The action did not report the version as published. \
+          The upload path is not verified; do not treat this as a pass."
+            exit 1
+          fi
+          echo "::notice::HCP accepted the archive and the version reached a published state."
