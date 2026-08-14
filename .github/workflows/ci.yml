@@ -88,9 +88,23 @@ jobs:
       # github.head_ref reaches the shell through env, never through `${{ }}`
       # interpolation into the script body: a branch name is attacker-chosen
       # text, and pasting it into a `run:` block is a shell-injection sink.
+      #
+      # The bot test is `github.event.pull_request.user.login`, not
+      # `github.actor`. github.actor is whoever most recently caused a run — a
+      # re-run, or a push onto the branch — so a third party can make it read
+      # `dependabot[bot]` on a pull request Dependabot did not author. That is
+      # zizmor's `bot-conditions` audit. Nothing privileged hangs off this
+      # condition today (it only decides which message prints, in a job holding
+      # `contents: read`), but it is the gate anything privileged would reuse,
+      # so it is written the non-spoofable way now rather than after something
+      # is attached to it. Paired with a same-repository head check: Dependabot
+      # branches live in THIS repo, so a head ref that does not is not the case
+      # this advice is for.
       - name: What to do about this Dependabot bump
         if: >-
-          always() && github.actor == 'dependabot[bot]' &&
+          always() &&
+          github.event.pull_request.user.login == 'dependabot[bot]' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
           (steps.rebuild.outcome == 'failure' || steps.dist-sync.outcome == 'failure')
         env:
           HEAD_REF: ${{ github.head_ref }}
