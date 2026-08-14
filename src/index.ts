@@ -110,10 +110,15 @@ function buildPublisher(): RegistryPublisher {
   // that `skip-tls-verify` is refused wherever it is set rather than silently
   // ignored on the HCP path.
   const tlsTrust = resolveTlsTrust(core.getInput('skip-tls-verify'), core.getInput('ca-cert'))
+  // setSecret so a proxy URL carrying `user:password@` — which arrives from the
+  // runner's environment, not from an action input, so maskCredentials() never
+  // saw it — is registered before the agent that could echo it in a connection
+  // error is built.
+  const clientOptions = { ...tlsTrust, setSecret: core.setSecret }
 
   if (type === 'private') {
     return new PrivateRegistryPublisher(
-      createHttpsClient(authorizeHost, tlsTrust),
+      createHttpsClient(authorizeHost, clientOptions),
       {
         ...coordinates,
         registryUrl: required('registry-url'),
@@ -128,7 +133,7 @@ function buildPublisher(): RegistryPublisher {
 
   if (type === 'hcp') {
     return new HcpPublisher(
-      createHttpsClient(authorizeHost, tlsTrust),
+      createHttpsClient(authorizeHost, clientOptions),
       {
         ...coordinates,
         address: core.getInput('hcp-address') || 'https://app.terraform.io',

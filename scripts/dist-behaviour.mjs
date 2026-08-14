@@ -38,6 +38,8 @@ import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer } from 'node:https'
+import { createServer as createHttpServer } from 'node:http'
+import { connect as netConnect } from 'node:net'
 import { fileURLToPath } from 'node:url'
 
 const DIST = process.argv[2] ?? fileURLToPath(new URL('../dist/index.js', import.meta.url))
@@ -93,15 +95,28 @@ function runAction(extraEnv) {
   return new Promise((resolve) => {
     let stdout = ''
     let stderr = ''
-    const child = spawn(process.execPath, [DIST], {
-      env: {
-        ...process.env,
-        RUNNER_TEMP: runnerTemp,
-        GITHUB_OUTPUT: outFile,
-        ...BASE_INPUTS,
-        ...extraEnv,
-      },
-    })
+    const env = {
+      ...process.env,
+      RUNNER_TEMP: runnerTemp,
+      GITHUB_OUTPUT: outFile,
+      // The action now HONOURS these, so `...process.env` would otherwise let a
+      // developer's own shell proxy decide where every check below sends its
+      // requests — and the loopback registries these checks stand up are
+      // exactly what such a proxy would refuse. Cleared to a known-empty
+      // baseline; the proxy checks set them explicitly through extraEnv.
+      HTTPS_PROXY: undefined,
+      https_proxy: undefined,
+      HTTP_PROXY: undefined,
+      http_proxy: undefined,
+      NO_PROXY: undefined,
+      no_proxy: undefined,
+      ...BASE_INPUTS,
+      ...extraEnv,
+    }
+    // An explicit `undefined` UNSETS the variable rather than passing the
+    // string "undefined".
+    for (const [k, v] of Object.entries(env)) if (v === undefined) delete env[k]
+    const child = spawn(process.execPath, [DIST], { env })
     child.stdout.on('data', (d) => (stdout += d))
     // Kept only for diagnostics. A load-time throw dumps the entire minified
     // program here; nothing asserts on it.
@@ -904,6 +919,177 @@ console.log('\n=== a module-directory holding no Terraform is refused ===')
     !reg.requests.some((q) => q.method === 'PUT'),
     JSON.stringify(reg.requests.map((q) => q.method)),
   )
+}
+
+// --------------------------------------------------------------------------
+// #17 Egress proxy. The unit suite injects both the environment and the mask
+// sink, so NEITHER of the two entrypoint wirings this depends on — that the
+// resolver defaults to `process.env`, and that `core.setSecret` is the sink —
+// is observable there. They are observable here, in the bundle consumers run.
+// --------------------------------------------------------------------------
+
+/**
+ * A minimal forward proxy: it answers CONNECT by splicing a TCP socket to the
+ * requested destination, which is the tunnel an enterprise egress proxy gives.
+ */
+function startProxy() {
+  const connects = []
+  const server = createHttpServer((_req, res) => {
+    res.writeHead(405)
+    res.end()
+  })
+  server.on('connect', (req, clientSocket, head) => {
+    connects.push(req.url ?? '')
+    const [host, port] = (req.url ?? '').split(':')
+    const upstream = netConnect(Number(port), host, () => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+      upstream.write(head)
+      upstream.pipe(clientSocket)
+      clientSocket.pipe(upstream)
+    })
+    upstream.on('error', () => clientSocket.destroy())
+    clientSocket.on('error', () => upstream.destroy())
+  })
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () =>
+      resolve({
+        connects,
+        url: `http://127.0.0.1:${server.address().port}`,
+        port: server.address().port,
+        close: () =>
+          new Promise((done) => {
+            server.closeAllConnections()
+            server.close(done)
+          }),
+      }),
+    )
+  })
+}
+
+/**
+ * A private-registry publish that succeeds, so the happy path is observable —
+ * a refusal-only block would pass just as well on a bundle that never worked.
+ * The module lookup answers 200 and the tag-sync answers 202, which is the
+ * exact status `PrivateRegistryPublisher` requires.
+ */
+const publishOk = (req, res) => {
+  if (req.method === 'POST') return json(res, 202, {})
+  return json(res, 200, { id: MODULE_ID })
+}
+
+console.log('\n=== #17  registry calls honour the runner proxy from their own environment ===')
+{
+  const reg = await startRegistry(publishOk)
+  const proxy = await startProxy()
+  const r = await runAction({
+    'INPUT_REGISTRY-URL': reg.url,
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': '127.0.0.1',
+    HTTPS_PROXY: proxy.url,
+  })
+  await reg.close()
+  await proxy.close()
+  // The load-bearing one. Both servers are on loopback, so a bundle that
+  // ignored HTTPS_PROXY entirely would ALSO reach the registry and pass every
+  // other assertion here — the tunnel record is the only thing that separates
+  // "through the chokepoint" from "around it".
+  check(
+    'the proxy saw a CONNECT to the registry',
+    proxy.connects.length > 0 && proxy.connects.every((c) => c === `127.0.0.1:${reg.port}`),
+    JSON.stringify(proxy.connects),
+  )
+  check('the registry was reached through the tunnel', reg.requests.length > 0, JSON.stringify(reg.requests.map((q) => q.method)))
+  check('the step succeeded', r.code === 0 && !errorLine(r), errorLine(r) || `exit ${r.code}`)
+}
+
+console.log('\n=== #17  NO_PROXY is honoured from the runner environment ===')
+{
+  const reg = await startRegistry(publishOk)
+  const proxy = await startProxy()
+  const r = await runAction({
+    'INPUT_REGISTRY-URL': reg.url,
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': '127.0.0.1',
+    HTTPS_PROXY: proxy.url,
+    NO_PROXY: '127.0.0.1',
+  })
+  await reg.close()
+  await proxy.close()
+  check('the proxy was never dialled', proxy.connects.length === 0, JSON.stringify(proxy.connects))
+  check('the registry was reached directly', reg.requests.length > 0, JSON.stringify(reg.requests.map((q) => q.method)))
+  check('the step succeeded', r.code === 0 && !errorLine(r), errorLine(r) || `exit ${r.code}`)
+}
+
+console.log('\n=== #17  a proxy credential reaches the job mask ===')
+{
+  // The proxy URL arrives from the ENVIRONMENT, not from an action input, so
+  // maskCredentials() never saw it. This is the only layer that can observe
+  // `core.setSecret` actually being the sink.
+  const reg = await startRegistry(publishOk)
+  const proxy = await startProxy()
+  const r = await runAction({
+    'INPUT_REGISTRY-URL': reg.url,
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': '127.0.0.1',
+    HTTPS_PROXY: `http://bob:hunter2@127.0.0.1:${proxy.port}`,
+  })
+  await reg.close()
+  await proxy.close()
+  check(
+    '::add-mask:: emitted for the proxy password',
+    r.stdout.includes('::add-mask::hunter2'),
+    r.stdout.split('\n').filter((l) => l.includes('add-mask')).join(' | ') || '(no mask line)',
+  )
+  check('the credentialed proxy still carried the request', proxy.connects.length > 0, JSON.stringify(proxy.connects))
+}
+
+console.log('\n=== #17  a proxy is not a way around egress authorization ===')
+{
+  // The destination is refused by registry-allowed-hosts, and a configured
+  // proxy must not change that: a CONNECT tunnel to an unauthorized host is
+  // still unauthorized egress. The allowlist below permits the PROXY's own host
+  // (127.0.0.1 names both here), which is the laundering attempt — and the
+  // destination is refused all the same because the allowlist entry carries a
+  // port that the registry's does not match.
+  const reg = await startRegistry(publishOk)
+  const proxy = await startProxy()
+  const r = await runAction({
+    'INPUT_REGISTRY-URL': reg.url,
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': `127.0.0.1:${proxy.port}`,
+    HTTPS_PROXY: proxy.url,
+  })
+  await reg.close()
+  await proxy.close()
+  check(
+    'the refusal names the destination and the input',
+    r.code !== 0 && /127\.0\.0\.1.*registry-allowed-hosts/.test(errorLine(r)),
+    errorLine(r) || '(no ::error:: on stdout)',
+  )
+  check('nothing was tunnelled', proxy.connects.length === 0, JSON.stringify(proxy.connects))
+  check('the registry credential never left the runner', reg.requests.length === 0, JSON.stringify(reg.requests.map((q) => q.method)))
+}
+
+console.log('\n=== #17  an unusable proxy variable fails closed rather than going direct ===')
+{
+  const reg = await startRegistry(publishOk)
+  const proxy = await startProxy()
+  const r = await runAction({
+    'INPUT_REGISTRY-URL': reg.url,
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': '127.0.0.1',
+    HTTPS_PROXY: 'not a url',
+  })
+  await reg.close()
+  await proxy.close()
+  check(
+    'the refusal names the variable',
+    r.code !== 0 && /HTTPS_PROXY/.test(errorLine(r)),
+    errorLine(r) || '(no ::error:: on stdout)',
+  )
+  check('the variable value is never echoed', !/not a url/.test(r.stdout), errorLine(r))
+  check('the request did NOT quietly go direct', reg.requests.length === 0, JSON.stringify(reg.requests.map((q) => q.method)))
+  check('and nothing was tunnelled either', proxy.connects.length === 0, JSON.stringify(proxy.connects))
 }
 
 console.log(`\n${failures === 0 ? 'ALL DIST CHECKS PASSED' : `${failures} DIST CHECK(S) FAILED`}`)
