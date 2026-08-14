@@ -18,7 +18,7 @@
     "undici": "^6.28.0"
   },
   "overrides": {
-    "undici": "^6.28.0"
+    "undici": "$undici"
   },
   "devDependencies": {
     "@types/node": "^26",
