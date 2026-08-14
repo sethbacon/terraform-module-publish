@@ -1,4 +1,9 @@
-import { METADATA_TIMEOUT_MS, createHttpClient } from '@4cloudguru/pipeline-task-core';
+import {
+    HttpError,
+    METADATA_TIMEOUT_MS,
+    createHttpClient,
+    truncateForLog,
+} from '@4cloudguru/pipeline-task-core';
 import { Agent } from 'undici';
 import { URL } from 'url';
 import { AuthorizeHost } from './egress';
@@ -103,17 +108,34 @@ export function createHttpsClient(authorizeHost: AuthorizeHost, options: HttpsCl
             // the host and an allowlist entry without one cannot silently match
             // a redirect to a different port. Awaited: an async rejection that
             // is not awaited cannot stop the in-flight request.
+            //
+            // The refusal is re-thrown NON-retryable. `fetchStatusText` retries,
+            // and the shared client classifies any non-HttpError as a transient
+            // transport failure — so a plain throw here would be REPEATED,
+            // giving a host that resolves differently per lookup several chances
+            // inside one run to flip from refused to allowed. The library's own
+            // `downloadToFile` wraps its `authorizeHost` refusal for the same
+            // reason.
             redirectPolicy: async (_originHost, next) => {
-                await authorizeHost(next.host);
+                try {
+                    await authorizeHost(next.host);
+                } catch (error) {
+                    throw new HttpError(error instanceof Error ? error.message : String(error), false);
+                }
                 return true;
             },
         });
 
+        // Outside the retrying accessor, so this refusal is already fatal.
         await authorizeHost(new URL(url).hostname);
-        return client.fetchWithTimeout(url, METADATA_TIMEOUT_MS, async (response) => ({
-            status: response.status,
-            body: await response.text(),
-        }));
+        // `fetchStatusText`, not a hand-rolled `consume`: a caller-supplied
+        // consume owns the body and never reaches the shared client's
+        // `readBounded`, so `maxResponseBytes` silently did not apply to it and
+        // a hostile or wedged registry could stream until the runner OOMed —
+        // while `waitForVersion`/`waitForOk` re-issued the same request every
+        // three seconds. This accessor returns the status alongside a BOUNDED
+        // body.
+        return client.fetchStatusText(url, METADATA_TIMEOUT_MS);
     };
 }
 
@@ -139,9 +161,42 @@ export function describeError(error: unknown): string {
     return parts.length > 0 ? parts.join(': ') : String(error);
 }
 
-/** Parses a JSON response body into the requested shape. */
-export function parseJson<T>(body: string): T {
-    return JSON.parse(body) as T;
+/**
+ * Makes a registry-controlled response body safe to put in a message that
+ * reaches `core.setFailed`.
+ *
+ * The body is chosen by whatever host `registry-url` / `hcp-address` names, and
+ * `core.setFailed` writes it as an `::error::` workflow command that the runner
+ * renders as a job-level annotation in the PR Checks UI. GitHub's own escaping
+ * covers only `%`, CR and LF, so without this the peer picks both the LENGTH of
+ * the consumer's annotation — enough volume buries the real error — and every
+ * other C0 control character in it. `truncateForLog` strips first and truncates
+ * second, so a control character cannot ride in on the boundary.
+ */
+export function bodyExcerpt(body: string): string {
+    return truncateForLog(body, 512);
+}
+
+/**
+ * Parses a JSON response body into the requested shape.
+ *
+ * The cast is a compile-time fiction — nothing here validates that the parsed
+ * value matches `T`, and callers must guard the shapes they then index into.
+ * What this DOES guarantee is that a body which is not JSON at all fails with a
+ * message naming which response was bad and showing a bounded excerpt of it,
+ * rather than the bare `SyntaxError: Unexpected token ...` that a registry, a
+ * WAF or a proxy interstitial answering 2xx with an HTML error page used to
+ * produce. That error propagated to the single top-level catch with none of the
+ * calling context preserved.
+ *
+ * @param what names the response being parsed, e.g. `The registry module response`.
+ */
+export function parseJson<T>(body: string, what: string): T {
+    try {
+        return JSON.parse(body) as T;
+    } catch {
+        throw new Error(`${what} was not valid JSON: ${bodyExcerpt(body)}`);
+    }
 }
 
 /** Resolves after the given number of milliseconds. */

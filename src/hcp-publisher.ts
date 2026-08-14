@@ -1,4 +1,4 @@
-import { HttpClient, parseJson, delay } from './http';
+import { HttpClient, bodyExcerpt, parseJson, delay } from './http';
 import { ModuleCoordinates, PublishResult, RegistryPublisher } from './types';
 
 /** Inputs for publishing to HCP Terraform / Terraform Enterprise. */
@@ -64,10 +64,25 @@ export function vcsUrl(address: string, namespace: string): string {
     return `${address.replace(/\/+$/, '')}/api/v2/organizations/${encodeURIComponent(namespace)}/registry-modules/vcs`;
 }
 
+/**
+ * Reads one version's status out of HCP's module description.
+ *
+ * `Array.isArray` rather than `?? []`: the nullish default only substitutes for
+ * null/undefined, so a `version-statuses` that is present but a TRUTHY non-array
+ * — an object, a string, whatever an intermediary or a compromised endpoint
+ * chose to send — reached `.find` and threw `TypeError: statuses.find is not a
+ * function` from inside the wait loop. `hasVersion` in the private publisher,
+ * this function's structural twin, already guarded its array; this one did not.
+ * A non-array is treated as "no known status", which is what the callers'
+ * `=== 'ok'` comparison already means by "not ready yet".
+ */
 export function versionStatus(body: string, version: string): string | undefined {
-    const parsed = parseJson<HcpModuleResponse>(body);
-    const statuses = parsed.data?.attributes?.['version-statuses'] ?? [];
-    return statuses.find((s) => s.version === version)?.status;
+    const parsed = parseJson<HcpModuleResponse>(body, 'The HCP Terraform module response');
+    const statuses = parsed.data?.attributes?.['version-statuses'];
+    if (!Array.isArray(statuses)) {
+        return undefined;
+    }
+    return statuses.find((s) => s?.version === version)?.status;
 }
 
 /**
@@ -79,7 +94,8 @@ export function versionStatus(body: string, version: string): string | undefined
  * tag-based, and HCP fills its versions in from pushed tags.
  */
 export function publishMode(body: string): PublishMode {
-    const vcsRepo = parseJson<HcpModuleResponse>(body).data?.attributes?.['vcs-repo'];
+    const vcsRepo = parseJson<HcpModuleResponse>(body, 'The HCP Terraform module response').data
+        ?.attributes?.['vcs-repo'];
     return vcsRepo && !vcsRepo.branch ? 'tag-based' : 'upload-driven';
 }
 
@@ -90,7 +106,10 @@ export function publishMode(body: string): PublishMode {
  */
 export function requiresContentUpload(body: string): boolean {
     try {
-        return Boolean(parseJson<HcpVersionResponse>(body).data?.links?.upload);
+        return Boolean(
+            parseJson<HcpVersionResponse>(body, 'The HCP Terraform version response').data?.links
+                ?.upload,
+        );
     } catch {
         // A body that is not JSON cannot be asserting an upload requirement.
         return false;
@@ -144,6 +163,13 @@ export class HcpPublisher implements RegistryPublisher {
         private readonly http: HttpClient,
         private readonly options: HcpOptions,
         private readonly log: (message: string) => void = console.log,
+        /**
+         * Diagnostic channel for the FULL response body of a failed request.
+         * Wired to `core.debug`, so it is suppressed unless the consumer sets
+         * `ACTIONS_STEP_DEBUG` — the always-visible annotation gets only the
+         * bounded, control-character-stripped excerpt.
+         */
+        private readonly debug: (message: string) => void = () => {},
     ) {}
 
     async publish(): Promise<PublishResult> {
@@ -169,7 +195,10 @@ export class HcpPublisher implements RegistryPublisher {
             this.log(`Module not found; creating VCS-connected module ${o.namespace}/${o.name}/${o.provider}.`);
             const created = await this.http('POST', vcsUrl(o.address, o.namespace), headers, vcsModuleBody(o));
             if (created.status < 200 || created.status >= 300) {
-                throw new Error(`Failed to create HCP module (HTTP ${created.status}): ${created.body}`);
+                this.debug(`HCP module-creation response body: ${created.body}`);
+                throw new Error(
+                    `Failed to create HCP module (HTTP ${created.status}): ${bodyExcerpt(created.body)}`,
+                );
             }
             mode = o.vcsBranch ? 'upload-driven' : 'tag-based';
         } else {
@@ -217,7 +246,10 @@ export class HcpPublisher implements RegistryPublisher {
         if (versionResp.status === 422) {
             this.log(`Version ${o.version} already exists.`);
         } else if (versionResp.status < 200 || versionResp.status >= 300) {
-            throw new Error(`Failed to create version (HTTP ${versionResp.status}): ${versionResp.body}`);
+            this.debug(`HCP version-creation response body: ${versionResp.body}`);
+            throw new Error(
+                `Failed to create version (HTTP ${versionResp.status}): ${bodyExcerpt(versionResp.body)}`,
+            );
         } else if (requiresContentUpload(versionResp.body)) {
             // The upload URL HCP returned is deliberately NOT echoed: it is a
             // bearer capability to write that object, and step logs are not the

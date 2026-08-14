@@ -30,7 +30,7 @@ consumers alike.
 | `hcp-token` | `""` | HCP/TFE API token (required for `hcp`) |
 | `vcs-repo-identifier` / `vcs-oauth-token-id` | `""` | used to create an HCP module if missing |
 | `vcs-branch` | `""` | empty creates a **tag-based** module; a branch creates one whose versions need an archive upload (see [HCP publishing modes](#hcp-publishing-modes)) |
-| `commit-sha` | `""` | commit associated with the new HCP version |
+| `commit-sha` | `$GITHUB_SHA` | commit recorded on the new HCP version; defaults to the commit the workflow ran on (see [Version provenance](#version-provenance)) |
 | `wait-for-publish` | `false` | wait until the version is available/ready |
 | `timeout-seconds` | `180` | wait timeout |
 | `registry-allowed-hosts` | `""` | hosts the registry requests may reach (see [Registry egress](#registry-egress)) |
@@ -132,10 +132,46 @@ The host-authorization primitives come from
 shared with the Azure Pipelines task extensions, so this action and they cannot
 drift apart.
 
+## Version provenance
+
+Read this before treating a green run as evidence of *what* was published.
+
+**HCP.** The version this action creates carries `commit-sha`, which defaults to
+the runner's `GITHUB_SHA` — the commit the workflow ran on. That is the binding
+between the registry's version record and your repository, and you get it
+without setting anything. Override `commit-sha` only when the version genuinely
+comes from a different commit.
+
+**Private registry.** This action does **not** upload module content. It calls
+the registry's `POST /api/v1/admin/modules/{id}/scm/sync`, which asks the
+registry to re-read its own SCM link and import whatever the matching tags
+resolve to *at sync time*. Two consequences follow, and neither is something
+this action can close on its own:
+
+- The endpoint is module-scoped and accepts no ref and no body, so the action
+  cannot pin the sync to a commit. Between your `checkout` and the registry's
+  fetch there is a window in which a force-moved tag changes what gets
+  published.
+- `wait-for-publish` polls until the version *string* appears. The registry's
+  module response carries no commit for a version, so "1.2.3 is present" is all
+  that can be asserted — not that its content is what your workflow built.
+
+Both need a registry-side API change (a ref-scoped sync, and a commit on the
+version record) and are tracked in `terraform-registry-backend`. Until then,
+protect the tag rather than relying on this action: make the publishing
+workflow's trigger a tag push, and prevent tags from being force-moved.
+
 ## Examples
 
 ```yaml
-# self-hosted registry (on a version tag)
+# self-hosted registry. `version` comes from a TAG trigger:
+#
+#   on:
+#     push:
+#       tags: ["v*"]
+#
+# github.ref_name is the tag there. On any other trigger it is a BRANCH name,
+# which is how a branch name ends up published as a module version.
 - uses: sethbacon/terraform-module-publish@v1
   with:
     registry-type: private
