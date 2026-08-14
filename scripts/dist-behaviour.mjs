@@ -838,6 +838,189 @@ console.log('\n=== HCP upload-driven: the module archive is built and uploaded =
 }
 
 // --------------------------------------------------------------------------
+// API-driven publishing, with NO VCS inputs at all.
+//
+// This is the shape a consumer following the README gets — action.yml defaults
+// both VCS inputs to "" — and it is what the live HCP smoke ran. The module
+// does not exist yet, and the tarball-upload flow exists precisely to serve
+// publishing that has no VCS connection, so the action has to bootstrap the
+// module before there is anything to publish a version into. It used to refuse,
+// demanding VCS inputs this flow by construction does not have.
+//
+// Only the dist layer sees this end to end: `npm test` never imports
+// src/index.ts, so nothing there observes that the two VCS inputs actually
+// arrive EMPTY from action.yml's defaults rather than unset-and-defaulted
+// somewhere along the way.
+// --------------------------------------------------------------------------
+console.log('\n=== HCP no-VCS: a missing module is created, then the version uploaded ===')
+{
+  const moduleDir = mkdtempSync(join(work, 'module-novcs-'))
+  writeFileSync(join(moduleDir, 'main.tf'), 'resource "null_resource" "a" {}\n')
+
+  let exists = false
+  let uploadLink = ''
+  const reg = await startRegistry((req, res) => {
+    // 404 until the create lands, which is how HCP answers for a module that is
+    // not there yet — the status that used to end the run.
+    if (req.method === 'GET') {
+      return exists
+        ? json(res, 200, { data: { attributes: { 'version-statuses': [] } } })
+        : json(res, 404, { errors: [{ status: '404', title: 'not found' }] })
+    }
+    if (req.method === 'POST' && req.url.endsWith('/registry-modules')) {
+      exists = true
+      return json(res, 201, { data: { type: 'registry-modules', attributes: {} } })
+    }
+    if (req.method === 'POST') return json(res, 201, { data: { links: { upload: uploadLink } } })
+    res.writeHead(200)
+    res.end('')
+  })
+  uploadLink = `${reg.url}/v1/object/novcs-capability`
+  const r = await runAction({
+    'INPUT_REGISTRY-TYPE': 'hcp',
+    'INPUT_HCP-ADDRESS': reg.url,
+    'INPUT_HCP-TOKEN': HCP_TOKEN,
+    'INPUT_MODULE-DIRECTORY': moduleDir,
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': '127.0.0.1',
+  })
+  await reg.close()
+
+  const create = reg.requests.find((q) => q.method === 'POST' && q.path.endsWith('/registry-modules'))
+  check(
+    'the missing module is created instead of the step failing',
+    r.code === 0 && create !== undefined && outputValue(r.output, 'published') === 'true',
+    `exit ${r.code}: ${JSON.stringify(reg.requests.map((q) => `${q.method} ${q.path}`))} ${errorLine(r)}`,
+  )
+  check(
+    'the create goes to the organization collection, not the /vcs endpoint',
+    create?.path === '/api/v2/organizations/acme/registry-modules' &&
+      !reg.requests.some((q) => q.path.endsWith('/registry-modules/vcs')),
+    JSON.stringify(reg.requests.map((q) => `${q.method} ${q.path}`)),
+  )
+  // The documented payload, asserted on the peer's own view of the bytes.
+  const attrs = create ? JSON.parse(create.body || '{}').data?.attributes ?? {} : {}
+  check(
+    'the create sends the documented private no-VCS payload',
+    JSON.parse(create?.body || '{}').data?.type === 'registry-modules' &&
+      attrs.name === 'vpc' &&
+      attrs.provider === 'aws' &&
+      attrs['registry-name'] === 'private',
+    create ? create.body.slice(0, 300) : '(no create was issued)',
+  )
+  check(
+    'the create omits namespace, which a private module may not set',
+    create !== undefined && !('namespace' in attrs) && !('vcs-repo' in attrs),
+    create ? create.body.slice(0, 300) : '(no create was issued)',
+  )
+  check(
+    'the create carries the HCP bearer credential and the JSON:API content type',
+    create?.auth === `Bearer ${HCP_TOKEN}` && create?.contentType === 'application/vnd.api+json',
+    create ? `${create.auth.slice(0, 12)} / ${create.contentType}` : '(no create was issued)',
+  )
+  // The point of creating it at all: the version now has somewhere to land.
+  const put = reg.requests.find((q) => q.method === 'PUT')
+  check(
+    'the version is then created and the real archive uploaded',
+    reg.requests.some((q) => q.method === 'POST' && q.path.endsWith('/versions')) &&
+      put !== undefined &&
+      Buffer.concat(put.chunks)[0] === 0x1f &&
+      Buffer.concat(put.chunks)[1] === 0x8b,
+    JSON.stringify(reg.requests.map((q) => `${q.method} ${q.path}`)),
+  )
+}
+
+// --------------------------------------------------------------------------
+// Idempotency. Two runs can reach the create at once, and only one wins. HCP
+// documents no duplicate-specific status for this endpoint, so the loser is
+// converged by re-reading the module rather than by matching a status code the
+// API never promised — a publish that raced must not fail.
+// --------------------------------------------------------------------------
+console.log('\n=== HCP no-VCS: losing the create race still publishes ===')
+{
+  const moduleDir = mkdtempSync(join(work, 'module-race-'))
+  writeFileSync(join(moduleDir, 'main.tf'), 'resource "null_resource" "a" {}\n')
+
+  let uploadLink = ''
+  let creates = 0
+  const reg = await startRegistry((req, res) => {
+    // The module exists throughout from the registry's point of view AFTER the
+    // create is refused: the other run got there first.
+    if (req.method === 'GET') {
+      return creates === 0
+        ? json(res, 404, { errors: [{ status: '404' }] })
+        : json(res, 200, { data: { attributes: { 'version-statuses': [] } } })
+    }
+    if (req.method === 'POST' && req.url.endsWith('/registry-modules')) {
+      creates++
+      return json(res, 422, { errors: [{ detail: 'Name has already been taken' }] })
+    }
+    if (req.method === 'POST') return json(res, 201, { data: { links: { upload: uploadLink } } })
+    res.writeHead(200)
+    res.end('')
+  })
+  uploadLink = `${reg.url}/v1/object/race-capability`
+  const r = await runAction({
+    'INPUT_REGISTRY-TYPE': 'hcp',
+    'INPUT_HCP-ADDRESS': reg.url,
+    'INPUT_HCP-TOKEN': HCP_TOKEN,
+    'INPUT_MODULE-DIRECTORY': moduleDir,
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': '127.0.0.1',
+  })
+  await reg.close()
+  check(
+    'a refused create converges on the module that already exists',
+    r.code === 0 && creates === 1 && outputValue(r.output, 'published') === 'true' && !errorLine(r),
+    `exit ${r.code}: ${JSON.stringify(reg.requests.map((q) => `${q.method} ${q.path}`))} ${errorLine(r)}`,
+  )
+  check(
+    'the publish still completes with the archive uploaded',
+    reg.requests.some((q) => q.method === 'PUT') &&
+      /already exists/.test(outputValue(r.output, 'message') ?? '') === false,
+    JSON.stringify(reg.requests.map((q) => q.method)),
+  )
+}
+
+// --------------------------------------------------------------------------
+// A create that genuinely fails is still an error, and it must be REPORTED as
+// itself. Converging on "the module exists after all" must not turn an
+// authorization failure into a misleading "module does not exist".
+// --------------------------------------------------------------------------
+console.log('\n=== HCP no-VCS: a rejected create is reported as a rejected create ===')
+{
+  const moduleDir = mkdtempSync(join(work, 'module-denied-'))
+  writeFileSync(join(moduleDir, 'main.tf'), 'resource "null_resource" "a" {}\n')
+  const reg = await startRegistry((req, res) => {
+    if (req.method === 'GET') return json(res, 404, { errors: [{ status: '404' }] })
+    return json(res, 403, { errors: [{ detail: 'insufficient permissions to create modules' }] })
+  })
+  const r = await runAction({
+    'INPUT_REGISTRY-TYPE': 'hcp',
+    'INPUT_HCP-ADDRESS': reg.url,
+    'INPUT_HCP-TOKEN': HCP_TOKEN,
+    'INPUT_MODULE-DIRECTORY': moduleDir,
+    'INPUT_CA-CERT': CA,
+    'INPUT_REGISTRY-ALLOWED-HOSTS': '127.0.0.1',
+  })
+  await reg.close()
+  check(
+    'the failure names the create and its status, not a missing module',
+    r.code !== 0 &&
+      /Failed to create HCP module \(HTTP 403\)/.test(errorLine(r)) &&
+      !/does not exist/.test(errorLine(r)),
+    errorLine(r) || '(no ::error:: on stdout)',
+  )
+  check(
+    'no version was created and nothing was uploaded',
+    !reg.requests.some((q) => q.path.endsWith('/versions')) &&
+      !reg.requests.some((q) => q.method === 'PUT') &&
+      outputValue(r.output, 'published') === undefined,
+    JSON.stringify(reg.requests.map((q) => `${q.method} ${q.path}`)),
+  )
+}
+
+// --------------------------------------------------------------------------
 // The upload destination is chosen by a RESPONSE BODY, which is the SSRF shape
 // this family has already been bitten by. It is authorized against
 // registry-allowed-hosts exactly like the API host, before it is contacted.

@@ -55,16 +55,23 @@ inputs:
     required: false
     default: ""
   vcs-repo-identifier:
-    description: VCS repo identifier (org/repo) used to create the module if missing.
+    description: >-
+      VCS repo identifier (org/repo) used to create a VCS-CONNECTED module if it
+      does not exist. Supply it together with `vcs-oauth-token-id`; supplying
+      only one of the pair fails the step rather than creating a module of the
+      other kind. Leave BOTH empty (the default) for API-driven publishing: a
+      missing module is then created with no VCS connection, and its versions
+      are published by uploading the archive built from `module-directory`.
     required: false
     default: ""
   vcs-branch:
     description: >-
-      VCS branch for a VCS-connected HCP module. Leave empty (the default) to
-      create a TAG-based module, whose versions HCP imports from pushed git
-      tags. Setting a branch creates a branch-based module, whose versions are
-      created through the API and stay 'pending' until this action uploads the
-      archive built from `module-directory`.
+      VCS branch for a VCS-connected HCP module. Only consulted when a module
+      has to be created AND the VCS pair above is supplied. Leave empty (the
+      default) to create a TAG-based module, whose versions HCP imports from
+      pushed git tags. Setting a branch creates a branch-based module, whose
+      versions are created through the API and stay 'pending' until this action
+      uploads the archive built from `module-directory`.
     required: false
     default: ""
   module-directory:
@@ -78,7 +85,10 @@ inputs:
     required: false
     default: "."
   vcs-oauth-token-id:
-    description: HCP VCS OAuth token ID used to create the module if missing.
+    description: >-
+      HCP VCS OAuth token ID used to create a VCS-connected module if it does
+      not exist. Pairs with `vcs-repo-identifier`; see that input for what
+      leaving both empty does.
     required: false
     default: ""
   commit-sha:

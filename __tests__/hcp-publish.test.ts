@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { HcpPublisher, publishMode, uploadUrl, vcsModuleBody } from '../src/hcp-publisher'
+import {
+  HcpPublisher,
+  noVcsModuleBody,
+  publishMode,
+  uploadUrl,
+  vcsModuleBody,
+} from '../src/hcp-publisher'
 import type { HcpOptions } from '../src/hcp-publisher'
 import type { HttpResponse } from '../src/http'
 
@@ -24,7 +30,11 @@ const UPLOAD_URL = 'https://archivist.terraform.io/v1/object/dmF1bHQ6c2VjcmV0LWN
 const MODULE_URL =
   'https://app.terraform.io/api/v2/organizations/myorg/registry-modules/private/myorg/vpc/aws'
 const VERSIONS_URL = `${MODULE_URL}/versions`
-const VCS_URL = 'https://app.terraform.io/api/v2/organizations/myorg/registry-modules/vcs'
+const CREATE_URL = 'https://app.terraform.io/api/v2/organizations/myorg/registry-modules'
+const VCS_URL = `${CREATE_URL}/vcs`
+
+/** Neither VCS input supplied: the API-driven flow, which owns no VCS connection. */
+const NO_VCS: Partial<HcpOptions> = { vcsRepoIdentifier: '', vcsOauthTokenId: '' }
 
 /** A module HCP describes as tag-based: a VCS repo with no branch. */
 const tagBasedModule = (statuses: Array<{ version: string; status: string }> = []) =>
@@ -174,6 +184,50 @@ describe('module creation chooses the mode that can actually complete', () => {
     const body = JSON.parse(vcsModuleBody(options({ vcsBranch: 'release' })))
     expect(body.data.attributes['vcs-repo'].branch).toBe('release')
   })
+
+  /**
+   * The no-VCS creation body, checked field by field against HCP's documented
+   * "Create a Module" payload rather than against what the code happens to send.
+   *
+   * Source: HCP Terraform API docs, Private Registry > Modules, "Create a
+   * Module" — `POST /organizations/:organization_name/registry-modules`, whose
+   * sample payload is
+   * `{"data":{"type":"registry-modules","attributes":{"name":…,"provider":…,"registry-name":"private","no-code":…}}}`.
+   */
+  describe('the no-VCS creation body matches HCP’s documented payload', () => {
+    const body = () => JSON.parse(noVcsModuleBody(options(NO_VCS)))
+
+    it('is a registry-modules resource', () => {
+      expect(body().data.type).toBe('registry-modules')
+    })
+
+    it('carries the module name and provider', () => {
+      expect(body().data.attributes.name).toBe('vpc')
+      expect(body().data.attributes.provider).toBe('aws')
+    })
+
+    it("sets registry-name to 'private', which the API requires", () => {
+      expect(body().data.attributes['registry-name']).toBe('private')
+    })
+
+    /**
+     * "The namespace of this module. Cannot be set for private modules." The
+     * organization already names it, in the URL — sending it as well is a 422.
+     */
+    it('omits namespace, which a private module may not set', () => {
+      expect(body().data.attributes).not.toHaveProperty('namespace')
+    })
+
+    /** A no-code module is a different product surface; this publishes a normal one. */
+    it('does not request the no-code workflow', () => {
+      expect(body().data.attributes['no-code']).toBe(false)
+    })
+
+    /** No `vcs-repo`: that key is what makes HCP create a VCS-connected module. */
+    it('carries no vcs-repo at all', () => {
+      expect(body().data.attributes).not.toHaveProperty('vcs-repo')
+    })
+  })
 })
 
 interface FlowRow {
@@ -307,6 +361,88 @@ const FLOW_ROWS: FlowRow[] = [
     message: /module archive uploaded/,
     calls: [`GET ${MODULE_URL}`, `POST ${VCS_URL}`, `POST ${VERSIONS_URL}`, `PUT ${UPLOAD_URL}`],
   },
+  // ---- API-driven publishing: no VCS connection exists to create one from ----
+  //
+  // The tarball-upload flow exists precisely to serve publishing that has no VCS
+  // connection, so the action has to be able to bootstrap the module that flow
+  // needs. Before this, a 404 here was a hard error telling the operator to
+  // supply VCS inputs that the API-driven flow by definition does not have.
+  {
+    what: 'a missing module with no VCS inputs is created with no VCS connection, then uploaded',
+    over: NO_VCS,
+    script: {
+      [MODULE_URL]: [{ status: 404, body: '' }],
+      [CREATE_URL]: [{ status: 201, body: '{"data":{"attributes":{}}}' }],
+      [VERSIONS_URL]: [{ status: 201, body: versionPending }],
+      [UPLOAD_URL]: [{ status: 200, body: '' }],
+    },
+    published: true,
+    message: /module archive uploaded/,
+    // The no-VCS create goes to the plain registry-modules collection, NOT to
+    // the /vcs endpoint, which would demand an oauth token this flow lacks.
+    calls: [`GET ${MODULE_URL}`, `POST ${CREATE_URL}`, `POST ${VERSIONS_URL}`, `PUT ${UPLOAD_URL}`],
+  },
+  // Idempotency. HCP documents no duplicate-specific status for this endpoint
+  // (the table lists 201 / 422 / 403 / 404 only), so a create that loses a race
+  // is converged on by ASKING whether the module exists now, rather than by
+  // matching a status code the API never promised. Both rows below are the same
+  // race with a different status on the losing create.
+  ...[422, 409].map((status) => ({
+    what: `a create that loses a race (HTTP ${status}) converges on the module that now exists`,
+    over: NO_VCS,
+    script: {
+      [MODULE_URL]: [{ status: 404, body: '' }, ok(noVcsModule)],
+      [CREATE_URL]: [{ status, body: '{"errors":[{"detail":"has already been taken"}]}' }],
+      [VERSIONS_URL]: [{ status: 201, body: versionPending }],
+      [UPLOAD_URL]: [{ status: 200, body: '' }],
+    },
+    published: true,
+    message: /module archive uploaded/,
+    calls: [
+      `GET ${MODULE_URL}`,
+      `POST ${CREATE_URL}`,
+      `GET ${MODULE_URL}`,
+      `POST ${VERSIONS_URL}`,
+      `PUT ${UPLOAD_URL}`,
+    ],
+  })),
+  {
+    what: 'the racing winner’s module decides the mode, rather than it being assumed upload-driven',
+    over: NO_VCS,
+    script: {
+      [MODULE_URL]: [{ status: 404, body: '' }, ok(tagBasedModule())],
+      [CREATE_URL]: [{ status: 422, body: '{"errors":[{"detail":"has already been taken"}]}' }],
+    },
+    published: true,
+    message: /tag-based/,
+    // No version POST: the module that won the race takes versions from tags.
+    calls: [`GET ${MODULE_URL}`, `POST ${CREATE_URL}`, `GET ${MODULE_URL}`],
+  },
+  {
+    what: 'a genuinely failed create is reported as itself, not as "module does not exist"',
+    over: NO_VCS,
+    script: {
+      [MODULE_URL]: [{ status: 404, body: '' }, { status: 401, body: 'unauthorized' }],
+      [CREATE_URL]: [{ status: 401, body: 'invalid token' }],
+    },
+    reject: 'Failed to create HCP module (HTTP 401)',
+    calls: [`GET ${MODULE_URL}`, `POST ${CREATE_URL}`, `GET ${MODULE_URL}`],
+  },
+  {
+    what: 'a half-supplied VCS pair is refused rather than silently creating a no-VCS module',
+    over: { vcsRepoIdentifier: 'myorg/terraform-aws-vpc', vcsOauthTokenId: '' },
+    script: { [MODULE_URL]: [{ status: 404, body: '' }] },
+    reject: 'vcs-oauth-token-id',
+    // Nothing is created: the operator asked for a VCS module and is missing an input.
+    calls: [`GET ${MODULE_URL}`],
+  },
+  {
+    what: 'the other half of the VCS pair is refused the same way',
+    over: { vcsRepoIdentifier: '', vcsOauthTokenId: 'ot-123' },
+    script: { [MODULE_URL]: [{ status: 404, body: '' }] },
+    reject: 'vcs-repo-identifier',
+    calls: [`GET ${MODULE_URL}`],
+  },
   {
     what: 'tag-based, waiting, version never imported: times out rather than claiming success',
     over: { waitForPublish: true, timeoutSeconds: 0 },
@@ -328,6 +464,57 @@ describe('HCP publish flow', () => {
       expect(result.message).toMatch(row.message as RegExp)
     }
     expect(calls).toEqual(row.calls)
+  })
+})
+
+/**
+ * The no-VCS creation request as the PEER saw it.
+ *
+ * `noVcsModuleBody` being correct proves nothing on its own — the publisher
+ * could send something else entirely, to somewhere else entirely, and the pure
+ * function's tests would stay green. These assert the bytes that actually left.
+ */
+describe('the no-VCS module creation request', () => {
+  const run = async () => {
+    const { http, sent } = fakeHttp({
+      [MODULE_URL]: [{ status: 404, body: '' }],
+      [CREATE_URL]: [{ status: 201, body: '{"data":{"attributes":{}}}' }],
+      [VERSIONS_URL]: [{ status: 201, body: versionPending }],
+      [UPLOAD_URL]: [{ status: 200, body: '' }],
+    })
+    const logged: string[] = []
+    await new HcpPublisher(
+      http,
+      options(NO_VCS),
+      (m) => logged.push(m),
+      () => {},
+      () => {},
+      fakeArchive,
+    ).publish()
+    return { sent, logged, create: sent.find((s) => s.url === CREATE_URL) }
+  }
+
+  it('POSTs the documented payload to the registry-modules collection', async () => {
+    const { create } = await run()
+    expect(create?.method).toBe('POST')
+    expect(JSON.parse(create!.body as string)).toEqual({
+      data: {
+        type: 'registry-modules',
+        attributes: { name: 'vpc', provider: 'aws', 'registry-name': 'private', 'no-code': false },
+      },
+    })
+  })
+
+  /** Same authorization and JSON:API content type as every other API call. */
+  it('carries the HCP bearer token and the JSON:API content type', async () => {
+    const { create } = await run()
+    expect(create?.headers.Authorization).toBe('Bearer secret-token')
+    expect(create?.headers['Content-Type']).toBe('application/vnd.api+json')
+  })
+
+  it('says what it created, so the operator knows the module is new', async () => {
+    const { logged } = await run()
+    expect(logged.join('\n')).toMatch(/no VCS connection/)
   })
 })
 
