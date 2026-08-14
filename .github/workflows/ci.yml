@@ -21,20 +21,28 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm test
-      - name: Rebuild bundle and fail if dist is stale
-        run: |
-          npm run build
-          if ! git diff --exit-code -- dist/index.js; then
-            if [ "${GITHUB_ACTOR}" = "dependabot[bot]" ]; then
-              echo "::error::A bundled dependency changed, so dist/index.js no longer matches src/. Dependabot only edits package.json and package-lock.json — it never runs the build. Check out this branch, run 'npm run build', and commit dist/index.js."
-            else
-              echo "::error::dist is out of date — run 'npm run build' and commit the result."
-            fi
-            exit 1
-          fi
+      # Split from the staleness diff below so the two failures stay tellable
+      # apart. "This bundle cannot be built at all" and "this bundle is fine but
+      # the committed copy is behind it" need opposite responses, and collapsing
+      # them onto one red step is exactly what made a mechanical dependency bump
+      # read as a broken pull request and sit for a week.
+      #
+      # `npm run build` ends in scripts/verify-bundle.mjs, so a bundle carrying
+      # an unresolved-module stub fails HERE and never reaches the diff below.
+      # That ordering is load-bearing: the staleness gate compares dist/ to a
+      # fresh build OF ITSELF, so it cannot tell a good bundle from a dead one,
+      # and "rebuild and commit" would otherwise be sound advice that ships a
+      # bundle throwing MODULE_NOT_FOUND at every consumer.
+      - name: Rebuild the bundle
+        id: rebuild
+        run: npm run build
 
-      # Runs in this job, immediately after the build above, so it drives the
-      # bundle that build just produced.
+      # Immediately after the build, and BEFORE the staleness diff, so it drives
+      # the bundle that build just produced on every run — including the runs
+      # where dist/ is stale, which is precisely when someone is deciding whether
+      # to commit a rebuild. Sequenced after the diff it was skipped on exactly
+      # those runs, so the bundle a maintainer was about to commit was the one
+      # nothing had executed.
       #
       # The staleness gate is not cover for this and never was: it compares
       # dist/index.js to a fresh build OF ITSELF, so a bundle that throws at
@@ -46,3 +54,64 @@ jobs:
       # artifact consumers execute.
       - name: Execute the built bundle and assert its guards
         run: npm run test:dist
+
+      - name: Fail if the committed dist is stale
+        id: dist-sync
+        # Staged-then-diffed over the whole directory, matching the sibling
+        # action: a plain `git diff` compares TRACKED content only, so a file the
+        # build newly emits into dist/ is invisible to it and this gate would
+        # certify a bundle whose companion chunk was never committed. --force
+        # covers a path a .gitignore rule would otherwise hide.
+        run: |
+          git add --force -A -- dist
+          if ! git diff --cached --exit-code -- dist; then
+            echo "::error::dist is out of date — run 'npm run build' and commit the result."
+            exit 1
+          fi
+
+      # Dependabot edits package.json and the lockfile and never runs a build, so
+      # every bundled-dependency bump arrives with a stale dist and is red by
+      # construction. This step does not fix that; it says which of the two kinds
+      # of red it is and what to do about it, in the log of the run that failed.
+      #
+      # Deliberately NOT a bot that rebuilds and pushes to the branch. The usual
+      # recipe for that is `pull_request_target` with `contents: write`, which
+      # runs the pull request's own code with a writable token against the base
+      # repo — strictly worse than the problem it solves. The safe variant needs
+      # a write-capable credential this repo does not have, and the GITHUB_TOKEN
+      # variant cannot work at all here: a token-authored push produces no
+      # `pull_request` event, so `Conventional PR Title` — a required check that
+      # only that event creates — would never appear on the new head commit and
+      # the PR would go from actionably red to permanently unmergeable. See
+      # "Rebuilding dist/" in README.md.
+      #
+      # github.head_ref reaches the shell through env, never through `${{ }}`
+      # interpolation into the script body: a branch name is attacker-chosen
+      # text, and pasting it into a `run:` block is a shell-injection sink.
+      #
+      # The bot test is `github.event.pull_request.user.login`, not
+      # `github.actor`. github.actor is whoever most recently caused a run — a
+      # re-run, or a push onto the branch — so a third party can make it read
+      # `dependabot[bot]` on a pull request Dependabot did not author. That is
+      # zizmor's `bot-conditions` audit. Nothing privileged hangs off this
+      # condition today (it only decides which message prints, in a job holding
+      # `contents: read`), but it is the gate anything privileged would reuse,
+      # so it is written the non-spoofable way now rather than after something
+      # is attached to it. Paired with a same-repository head check: Dependabot
+      # branches live in THIS repo, so a head ref that does not is not the case
+      # this advice is for.
+      - name: What to do about this Dependabot bump
+        if: >-
+          always() &&
+          github.event.pull_request.user.login == 'dependabot[bot]' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          (steps.rebuild.outcome == 'failure' || steps.dist-sync.outcome == 'failure')
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          REBUILD: ${{ steps.rebuild.outcome }}
+        run: |
+          if [ "$REBUILD" = "failure" ]; then
+            echo "::error::This bump does not merely need a rebuild — the bundle cannot be built from it. Either the TypeScript compile failed or the bundler could not resolve a dependency and emitted a throwing stub (see the 'Rebuild the bundle' step above for which). Committing a rebuilt dist/ here would ship an action that fails before it runs. Close the PR or pin the dependency until upstream is fixed."
+          else
+            echo "::notice::This bump builds cleanly and the rebuilt bundle passed verification — the only thing missing is the committed dist/. To land it: git fetch origin \"$HEAD_REF\" && git switch \"$HEAD_REF\" && npm ci && npm run build && git commit -am 'build: rebuild dist for this dependency bump' && git push"
+          fi
