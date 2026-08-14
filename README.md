@@ -152,14 +152,20 @@ this action can close on its own:
   cannot pin the sync to a commit. Between your `checkout` and the registry's
   fetch there is a window in which a force-moved tag changes what gets
   published.
-- `wait-for-publish` polls until the version *string* appears. The registry's
-  module response carries no commit for a version, so "1.2.3 is present" is all
-  that can be asserted — not that its content is what your workflow built.
+- `wait-for-publish` polls until the version *string* appears. The registry
+  **does** record a `commit_sha` and `tag_name` per version, but its
+  `GET /api/v1/modules/{namespace}/{name}/{system}` response does not serialize
+  them, so "1.2.3 is present" is all a client can assert — not that its content
+  is what your workflow built.
 
-Both need a registry-side API change (a ref-scoped sync, and a commit on the
-version record) and are tracked in `terraform-registry-backend`. Until then,
-protect the tag rather than relying on this action: make the publishing
-workflow's trigger a tag push, and prevent tags from being force-moved.
+Both need a registry-side change — a ref-scoped sync, and exposing the commit
+the registry already stores — tracked as
+[terraform-registry-backend#879](https://github.com/sethbacon/terraform-registry-backend/issues/879).
+The second is additive and unblocks verification on its own; `wait-for-publish`
+will check the commit once it lands.
+
+Until then, protect the tag rather than relying on this action: trigger the
+publishing workflow on a tag push, and prevent tags from being force-moved.
 
 ## Examples
 
