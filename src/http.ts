@@ -2,9 +2,11 @@ import {
     HttpError,
     METADATA_TIMEOUT_MS,
     createHttpClient,
+    resolveEnvProxy,
     truncateForLog,
+    type ProxyEnvironment,
 } from '@4cloudguru/pipeline-task-core';
-import { Agent } from 'undici';
+import { Agent, ProxyAgent, type Dispatcher } from 'undici';
 import { URL } from 'url';
 import { AuthorizeHost } from './egress';
 
@@ -37,6 +39,20 @@ export interface HttpsClientOptions {
     caCert?: string;
     /** `fetch` implementation, injectable so tests need no network. */
     fetchImpl?: typeof fetch;
+    /**
+     * The runner's environment, read for `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY`.
+     * Defaults to `process.env`; injectable so tests need no global mutation.
+     */
+    env?: ProxyEnvironment;
+    /**
+     * Registers a proxy credential with the job's mask. Wire to
+     * `core.setSecret`.
+     *
+     * A proxy URL may embed `user:password@`, and it reaches this process from
+     * the environment rather than from an action input, so nothing else in the
+     * run has had the chance to mask it.
+     */
+    setSecret?: (secret: string) => void;
 }
 
 /** Refusal text for the withdrawn `skip-tls-verify` input; names the replacement. */
@@ -87,20 +103,90 @@ export function resolveTlsTrust(rawSkipTlsVerify: string, rawCaCert: string): Ht
  * hostname verification — the two checks that the withdrawn verification-off
  * switch dropped together.
  *
+ * On a self-hosted runner behind a mandatory egress proxy the requests are
+ * routed through it, because Node's `fetch` honours none of `HTTPS_PROXY` /
+ * `HTTP_PROXY` / `NO_PROXY` on its own — so every credential-bearing registry
+ * call used to leave the network outside the organisation's allowlist and audit
+ * trail, or fail with an undiagnosable connect error where direct egress is
+ * blocked. The proxy decision is re-taken for EVERY hop, never once for the
+ * original URL; see the per-hop resolver below.
+ *
  * @param authorizeHost the egress-authorization decision from `./egress`.
  * @param options trust anchor and test seams; see {@link HttpsClientOptions}.
  */
 export function createHttpsClient(authorizeHost: AuthorizeHost, options: HttpsClientOptions = {}): HttpClient {
-    const { caCert, fetchImpl } = options;
-    // One dispatcher for the client's lifetime, built only when the operator
-    // supplied a trust anchor; Node's fetch has no other way to reach that
-    // socket option.
-    const dispatcher = caCert ? new Agent({ connect: { ca: caCert } }) : undefined;
+    const { caCert, fetchImpl, env, setSecret } = options;
+    // Built once for the client's lifetime, only when the operator supplied a
+    // trust anchor; Node's fetch has no other way to reach that socket option.
+    // Used for the hops that go direct.
+    const direct = caCert ? new Agent({ connect: { ca: caCert } }) : undefined;
+    // Client-lifetime, keyed by proxy URL: `waitForVersion`/`waitForOk` re-issue
+    // a request every three seconds for up to `timeout-seconds`, so building a
+    // dispatcher per request would leak a connection pool per poll.
+    const proxyAgents = new Map<string, ProxyAgent>();
+    const masked = new Set<string>();
+
+    /**
+     * The dispatcher for ONE hop, chosen from that hop's own destination.
+     *
+     * Resolved per hop rather than once for the original URL because every part
+     * of the decision belongs to the destination: `NO_PROXY` is matched against
+     * it and its scheme picks the variable. A registry that redirects a module
+     * download off to a CDN — or an internal host covered by `NO_PROXY` —
+     * has to be answered again, and resolving once would send the later hops
+     * through the wrong route (or through a proxy not permitted to see them).
+     *
+     * WHAT THIS DOES NOT DECIDE. A proxy changes which socket carries the
+     * request, never which destination is permitted. `authorizeHost` still runs
+     * against the DESTINATION host — the initial one below and every redirect
+     * hop in `redirectPolicy` — and its subject is never the proxy: a CONNECT
+     * tunnel to an unauthorized host is still unauthorized egress. Nothing here
+     * is consulted by that decision, and nothing here can widen it.
+     */
+    function dispatcherFor(hopUrl: string): Dispatcher | undefined {
+        let proxy: ReturnType<typeof resolveEnvProxy>;
+        try {
+            proxy = resolveEnvProxy(hopUrl, env);
+        } catch (error) {
+            // Re-thrown NON-retryable, for the same reason the redirect refusal
+            // below is: an unusable proxy variable is a configuration error, and
+            // the shared client treats any non-HttpError as a transient
+            // transport failure, so a plain throw would be retried three times
+            // over — and `pollUntil` would then repeat that for the whole
+            // timeout. Fail closed and once — never silently direct, which is
+            // the failure that would put the registry bearer outside the
+            // chokepoint the variable exists to enforce.
+            throw new HttpError(error instanceof Error ? error.message : String(error), false);
+        }
+        if (!proxy) return direct;
+        // Masked before the agent is constructed, so a proxy that refuses the
+        // connection cannot put the credential in the error text unmasked.
+        // Deduped because polling resolves the same proxy every three seconds
+        // and each registration is an ::add-mask:: line in the log.
+        for (const secret of proxy.secrets) {
+            if (masked.has(secret)) continue;
+            masked.add(secret);
+            setSecret?.(secret);
+        }
+        let agent = proxyAgents.get(proxy.proxyUrl);
+        if (!agent) {
+            // `requestTls`, not `connect`: with a tunnel in play that is the
+            // TLS handshake with the DESTINATION, which is the peer `caCert`
+            // vouches for. Putting the anchor on the proxy leg instead would
+            // leave the destination handshake on the default store and fail
+            // exactly the private-CA case the input exists for.
+            agent = new ProxyAgent(
+                caCert ? { uri: proxy.proxyUrl, requestTls: { ca: caCert } } : { uri: proxy.proxyUrl },
+            );
+            proxyAgents.set(proxy.proxyUrl, agent);
+        }
+        return agent;
+    }
 
     return async (method, url, headers, body) => {
         const client = createHttpClient({
             fetchImpl,
-            fetchOptions: () => {
+            fetchOptions: (hopUrl) => {
                 const init: RequestInit = { method, headers };
                 if (body !== undefined) {
                     // Cast: a Uint8Array IS a valid `fetch` body at runtime, but
@@ -108,6 +194,7 @@ export function createHttpsClient(authorizeHost: AuthorizeHost, options: HttpsCl
                     // and a `Uint8Array<ArrayBufferLike>` does not satisfy it.
                     init.body = body as BodyInit;
                 }
+                const dispatcher = dispatcherFor(hopUrl);
                 if (dispatcher) {
                     (init as RequestInit & { dispatcher: unknown }).dispatcher = dispatcher;
                 }
