@@ -65,8 +65,17 @@ export function versionsUrl(o: HcpModuleRef): string {
     return `${moduleUrl(o)}/versions`;
 }
 
+/**
+ * The organization's registry-modules collection: both where a module with NO
+ * VCS connection is created and the base the VCS-connected creation endpoint
+ * hangs off. Written once so the two cannot drift apart.
+ */
+export function createModuleUrl(address: string, namespace: string): string {
+    return `${trimTrailingSlash(address)}/api/v2/organizations/${encodeURIComponent(namespace)}/registry-modules`;
+}
+
 export function vcsUrl(address: string, namespace: string): string {
-    return `${trimTrailingSlash(address)}/api/v2/organizations/${encodeURIComponent(namespace)}/registry-modules/vcs`;
+    return `${createModuleUrl(address, namespace)}/vcs`;
 }
 
 /**
@@ -170,6 +179,45 @@ export function vcsModuleBody(o: HcpOptions): string {
     });
 }
 
+/**
+ * Body for creating a private module with NO VCS connection.
+ *
+ * Shape taken from HCP Terraform's API documentation, Private Registry >
+ * Modules, "Create a Module" — `POST /organizations/:organization_name/
+ * registry-modules`, whose sample payload is
+ * `{"data":{"type":"registry-modules","attributes":{"name":"my-module",
+ * "provider":"aws","registry-name":"private","no-code":true}}}`. This is a
+ * DIFFERENT endpoint from the `/vcs` one {@link vcsModuleBody} feeds, and it is
+ * the one that produces a module whose versions come from `POST .../versions`
+ * plus an archive upload — exactly the flow this action performs.
+ *
+ * Two attributes are deliberate:
+ *
+ *  - `registry-name: 'private'` is required, and `private` is what makes this
+ *    the organization's own module rather than a curated public one.
+ *  - `namespace` is NOT sent. The docs say it "cannot be set for private
+ *    modules" — the organization in the URL already names it, and sending it
+ *    anyway is a 422. `o.namespace` IS that organization, so passing it through
+ *    is the natural mistake here.
+ *
+ * `no-code` is sent as false, as {@link vcsModuleBody} sends it: the no-code
+ * provisioning workflow is a different product surface from a module a
+ * consumer writes `module {}` against, and this action publishes the latter.
+ */
+export function noVcsModuleBody(o: ModuleCoordinates): string {
+    return JSON.stringify({
+        data: {
+            type: 'registry-modules',
+            attributes: {
+                name: o.name,
+                provider: o.provider,
+                'registry-name': 'private',
+                'no-code': false,
+            },
+        },
+    });
+}
+
 export function versionBody(version: string, commitSha: string): string {
     return JSON.stringify({
         data: {
@@ -180,11 +228,11 @@ export function versionBody(version: string, commitSha: string): string {
 }
 
 /**
- * Publishes a module version to HCP Terraform: checks the module, creates a VCS-connected module
- * if it does not exist, then completes the publish the way that module's own class of version
- * requires — observing the tag import for a tag-based module, or creating the version and
- * uploading the module archive for an upload-driven one — and (optionally) waits for it to
- * become ready.
+ * Publishes a module version to HCP Terraform: checks the module, creates it if it does not exist
+ * — VCS-connected when the VCS inputs are supplied, with no VCS connection when they are not —
+ * then completes the publish the way that module's own class of version requires — observing the
+ * tag import for a tag-based module, or creating the version and uploading the module archive for
+ * an upload-driven one — and (optionally) waits for it to become ready.
  */
 export class HcpPublisher implements RegistryPublisher {
     constructor(
@@ -227,17 +275,7 @@ export class HcpPublisher implements RegistryPublisher {
             }
             mode = publishMode(check.body);
         } else if (check.status === 404) {
-            if (!o.vcsRepoIdentifier || !o.vcsOauthTokenId) {
-                throw new Error(
-                    'Module does not exist and vcsRepoIdentifier / vcsOauthTokenId were not provided to create it.',
-                );
-            }
-            this.log(`Module not found; creating VCS-connected module ${o.namespace}/${o.name}/${o.provider}.`);
-            const created = await this.http('POST', vcsUrl(o.address, o.namespace), headers, vcsModuleBody(o));
-            if (created.status < 200 || created.status >= 300) {
-                throw httpError('create HCP module', created, this.debug);
-            }
-            mode = o.vcsBranch ? 'upload-driven' : 'tag-based';
+            mode = await this.createMissingModule(headers);
         } else {
             // Fail here rather than logging and carrying on. Anything that is
             // neither 2xx nor 404 is a 401 (bad or expired token), a 403, a 429
@@ -252,6 +290,101 @@ export class HcpPublisher implements RegistryPublisher {
         }
 
         return mode === 'tag-based' ? this.publishTagBased(headers) : this.publishUploadDriven(headers);
+    }
+
+    /**
+     * Creates the module the publish needs, and answers with the class of
+     * version it will take.
+     *
+     * Which module gets created is decided by the VCS inputs, because they are
+     * the only thing that can express a VCS connection:
+     *
+     *  - BOTH supplied: a VCS-connected module, exactly as before.
+     *  - NEITHER supplied: a module with no VCS connection. This is the
+     *    API-driven flow — the one the tarball upload exists to serve — and it
+     *    has no VCS connection to name by construction. It used to be a hard
+     *    error demanding VCS inputs that this flow cannot have, which left
+     *    creating the module an undocumented out-of-band step.
+     *  - EXACTLY ONE supplied: refused. Silently creating a no-VCS module for an
+     *    operator who plainly asked for a VCS-connected one would publish by a
+     *    different mechanism than they configured, and the half they forgot is
+     *    the useful thing to say.
+     */
+    private async createMissingModule(headers: Record<string, string>): Promise<PublishMode> {
+        const o = this.options;
+        if (o.vcsRepoIdentifier && o.vcsOauthTokenId) {
+            return this.createVcsModule(headers);
+        }
+        if (o.vcsRepoIdentifier || o.vcsOauthTokenId) {
+            const supplied = o.vcsRepoIdentifier ? 'vcs-repo-identifier' : 'vcs-oauth-token-id';
+            const missing = o.vcsRepoIdentifier ? 'vcs-oauth-token-id' : 'vcs-repo-identifier';
+            throw new Error(
+                `Module ${o.namespace}/${o.name}/${o.provider} does not exist, and only half of the pair ` +
+                    `needed to create a VCS-connected one was supplied: '${supplied}' is set but ` +
+                    `'${missing}' is not. Supply both to create a VCS-connected module, or neither to ` +
+                    'create a module with no VCS connection and publish it by uploading the module archive.',
+            );
+        }
+        return this.createNoVcsModule(headers);
+    }
+
+    /** Unchanged: the VCS-connected creation, reached only when both inputs are set. */
+    private async createVcsModule(headers: Record<string, string>): Promise<PublishMode> {
+        const o = this.options;
+        this.log(`Module not found; creating VCS-connected module ${o.namespace}/${o.name}/${o.provider}.`);
+        const created = await this.http('POST', vcsUrl(o.address, o.namespace), headers, vcsModuleBody(o));
+        if (created.status < 200 || created.status >= 300) {
+            throw httpError('create HCP module', created, this.debug);
+        }
+        return o.vcsBranch ? 'upload-driven' : 'tag-based';
+    }
+
+    /**
+     * Creates a module with no VCS connection, converging rather than failing
+     * when it turns out someone else created it first.
+     *
+     * IDEMPOTENCY, AND WHY IT IS NOT A STATUS CHECK. Two runs of this action can
+     * reach the create at once — two workflows publishing two versions, or a
+     * retry after a partial failure — and only one of them can win. HCP's
+     * documentation for this endpoint lists 201, 422, 403 and 404 and describes
+     * no duplicate-specific status at all, so a guard written as "treat 409 (or
+     * 422) as already-exists" would be pinned to a status the API never promised
+     * and would fail the loser of the race the day it answered with the other
+     * one. What IS unambiguous is the module's own existence, so that is what
+     * gets asked: on ANY failed create, re-read the module, and if it is there
+     * now, carry on with the publish. The loser of a race converges on success.
+     *
+     * The re-read also keeps a genuine failure legible. A 401 or 403 on create
+     * leaves the module still absent, the re-read fails too, and the error
+     * raised is the CREATE's own — "Failed to create HCP module (HTTP 401)" —
+     * rather than anything claiming the module merely does not exist.
+     *
+     * The mode comes from the module that actually exists, not from the
+     * assumption that it is the one this run tried to create: the winner of the
+     * race may have connected it to VCS, in which case its versions arrive by a
+     * different route entirely.
+     */
+    private async createNoVcsModule(headers: Record<string, string>): Promise<PublishMode> {
+        const o = this.options;
+        this.log(`Module not found; creating ${o.namespace}/${o.name}/${o.provider} with no VCS connection.`);
+        const created = await this.http(
+            'POST',
+            createModuleUrl(o.address, o.namespace),
+            headers,
+            noVcsModuleBody(o),
+        );
+        if (created.status >= 200 && created.status < 300) {
+            return 'upload-driven';
+        }
+
+        const recheck = await this.http('GET', moduleUrl(o), headers);
+        if (recheck.status >= 200 && recheck.status < 300) {
+            this.log(
+                `Module ${o.namespace}/${o.name}/${o.provider} already exists; continuing with the publish.`,
+            );
+            return publishMode(recheck.body);
+        }
+        throw httpError('create HCP module', created, this.debug);
     }
 
     /**

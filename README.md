@@ -10,7 +10,8 @@ consumers alike.
 
 - **private** — resolves the (already SCM-linked) module and triggers the
   registry's tag-sync so the freshly-pushed git tag is imported as a new version.
-- **hcp** — checks the module (creating a tag-based VCS module if missing) and
+- **hcp** — checks the module, creating it if it is missing (VCS-connected when
+  you supply the VCS inputs, otherwise with **no VCS connection**), and
   completes the publish the way that module's class of version requires: HCP
   imports the pushed tag, or — for a branch-based or VCS-less module — the
   action creates the version and uploads the module archive HCP is waiting for.
@@ -29,8 +30,8 @@ consumers alike.
 | `skip-tls-verify` | — | **removed**; setting it fails the step (see [Private CAs](#private-cas)) |
 | `hcp-address` | `https://app.terraform.io` | HCP/TFE base URL |
 | `hcp-token` | `""` | HCP/TFE API token (**required** for `hcp`) — needs `registry-modules` write, see [Token scope and host trust](#token-scope-and-host-trust) |
-| `vcs-repo-identifier` / `vcs-oauth-token-id` | `""` | used to create an HCP module if missing |
-| `vcs-branch` | `""` | empty creates a **tag-based** module; a branch creates one whose versions are completed by an archive upload (see [HCP publishing modes](#hcp-publishing-modes)) |
+| `vcs-repo-identifier` / `vcs-oauth-token-id` | `""` | supply **both** to create a missing HCP module VCS-connected; leave **both** empty for API-driven publishing, where a missing module is created with no VCS connection (see [Creating the module](#creating-the-module)) |
+| `vcs-branch` | `""` | only consulted when creating a VCS-connected module: empty creates a **tag-based** one; a branch creates one whose versions are completed by an archive upload (see [HCP publishing modes](#hcp-publishing-modes)) |
 | `module-directory` | `"."` | module source archived and uploaded when HCP asks for content; its contents land at the archive root (see [HCP publishing modes](#hcp-publishing-modes)) |
 | `commit-sha` | `$GITHUB_SHA` | commit recorded on the new HCP version; defaults to the commit the workflow ran on (see [Version provenance](#version-provenance)) |
 | `wait-for-publish` | `false` | wait until the version is available/ready |
@@ -64,9 +65,11 @@ which means the credential in your repository secrets reaches every module in
 that registry — provision it with a rotation schedule, and prefer an environment
 with required reviewers on the workflow that uses it.
 
-**`hcp-token` needs `registry-modules` write access** on the organization. Use a
-team token scoped to the organization rather than a personal user token, so
-revoking it does not depend on one person's account.
+**`hcp-token` needs `registry-modules` write access** on the organization —
+which also covers creating a module that does not exist yet, see
+[Creating the module](#creating-the-module). Use a team token scoped to the
+organization rather than a personal user token, so revoking it does not depend
+on one person's account.
 
 **`registry-url` and `hcp-address` are not validated against an allowlist by
 default.** Any host that is not private, link-local or otherwise reserved is
@@ -197,10 +200,10 @@ HCP Terraform fills in a module's versions one of two ways, and the action
 detects which from HCP's own description of the module rather than guessing from
 your inputs:
 
-- **Tag-based** (`vcs-branch` empty — the default, and what this action creates).
-  HCP imports every pushed git tag as a version by itself. There is no version
-  for this action to create and nothing to upload: it ensures the module exists
-  and, with `wait-for-publish: true`, waits for the version to become ready.
+- **Tag-based** (a VCS-connected module with `vcs-branch` empty). HCP imports
+  every pushed git tag as a version by itself. There is no version for this
+  action to create and nothing to upload: it ensures the module exists and, with
+  `wait-for-publish: true`, waits for the version to become ready.
 - **Branch-based** (`vcs-branch` set) **or no VCS repo at all.** The version is
   created through the API and sits at status `pending` until a gzipped module
   archive is uploaded to the URL HCP returns with it. The action builds that
@@ -209,6 +212,34 @@ your inputs:
 
 Because it is the workflow's tag push that produces a tag-based version, run
 this action on the tag (the first example below).
+
+### Creating the module
+
+If the module does not exist yet, the action creates it, and **the VCS inputs
+decide which kind it creates**:
+
+| `vcs-repo-identifier` + `vcs-oauth-token-id` | What is created | How versions arrive |
+|---|---|---|
+| both supplied | a VCS-connected module | pushed git tags (`vcs-branch` empty) or an archive upload (`vcs-branch` set) |
+| **both empty** (the default) | a module with **no VCS connection** | this action creates the version and uploads the archive built from `module-directory` |
+| exactly one supplied | nothing — the step fails, naming the missing input | — |
+
+**API-driven publishing needs no VCS configuration at all.** Point the action at
+a module that does not exist yet, leave both VCS inputs empty, and it creates the
+module and publishes the first version by upload. This is the flow the tarball
+upload exists for, so nothing has to be created out of band first.
+
+The only requirement is that `hcp-token` can create registry modules in the
+organization — the same `registry-modules` write access publishing a version
+already needs. A token without it fails with the create's own status
+(`Failed to create HCP module (HTTP 403)`), not with a message about the module
+being missing.
+
+Creation is **idempotent**. Two runs publishing two versions at once can both
+find the module missing and both try to create it; only one wins. The loser
+re-reads the module, finds it there, and carries on with its own publish rather
+than failing. (HCP documents no duplicate-specific status for this endpoint,
+so the module's existence is what gets checked, not a status code.)
 
 ### The uploaded archive
 
@@ -313,7 +344,11 @@ publishing workflow on a tag push, and prevent tags from being force-moved.
     version: ${{ github.ref_name }}
     wait-for-publish: "true"
 
-# HCP Terraform
+# HCP Terraform, API-driven: no VCS connection anywhere in the picture.
+#
+# With both VCS inputs left empty, a module that does not exist yet is created
+# with no VCS connection, and this version is published by uploading the archive
+# built from `module-directory` — nothing has to be created out of band first.
 - uses: sethbacon/terraform-module-publish@v1
   with:
     registry-type: hcp
@@ -322,6 +357,7 @@ publishing workflow on a tag push, and prevent tags from being force-moved.
     name: vpc
     provider: aws
     version: 1.2.3
+    module-directory: .
 ```
 
 ## Rebuilding `dist/`
