@@ -382,13 +382,23 @@ CI says which of two situations it is, in the failing run's log:
 
 - **"This bump does not merely need a rebuild …"** — the bundle cannot be built
   from that dependency set at all. **Do not commit a rebuilt `dist/`.** Either
-  `tsc` fails, or the bundler could not resolve a dependency. `@vercel/ncc`
-  0.44.1 does not fail that build: it exits 0 and writes a `webpackMissingModule`
-  stub in place of the import, producing a bundle that throws `MODULE_NOT_FOUND`
-  before the action's first line. `npm run build` therefore ends in
-  `scripts/verify-bundle.mjs`, which refuses to certify such a bundle — the
-  staleness gates cannot, since they compare `dist/` to a fresh build *of
-  itself* and a committed stub matches its own rebuild exactly.
+  `tsc` fails or the bundle would not load. `npm run build` is therefore three
+  steps, and each one is there to make a class of that failure impossible to
+  commit:
+
+  1. `npm run lint` (`tsc --noEmit`), because esbuild transpiles without
+     type-checking. Under `@vercel/ncc` the type check came free — its bundled
+     `ts-loader` failed the build on a type error — and dropping the bundler
+     without replacing it would have quietly moved a red build to a green one.
+  2. `esbuild`, which exits non-zero on an import it cannot resolve.
+  3. `scripts/verify-bundle.mjs`, which refuses a bundle that still resolves
+     something at run time. esbuild does *not* fail on every unresolved import:
+     an `--external` flag, a `require()` inside a `try`/`catch`, or a computed
+     specifier each exit 0 — the middle one without even a warning — and write a
+     bundle that looks for a module in a `node_modules` that is not shipped. The
+     staleness gates cannot catch that, since they compare `dist/` to a fresh
+     build *of itself* and a committed dead bundle matches its own rebuild
+     exactly.
 
 ### Why no bot pushes the rebuild
 
@@ -414,7 +424,7 @@ The examples above use `@v1` for readability. **`v1` is a mutable tag** — this
 repository's maintainers move it to each new `v1.x`, so what your workflow
 executes changes without any diff on your side. That is a convenience, and it is
 a trust decision you are making about this repository. What you actually run is
-a ~500 KB minified, sourcemap-free `ncc` bundle, so a substitution is not
+a ~440 KB minified, sourcemap-free `esbuild` bundle, so a substitution is not
 something anyone will catch by reading a diff.
 
 For supply-chain-sensitive workflows, pin the full commit SHA instead:
