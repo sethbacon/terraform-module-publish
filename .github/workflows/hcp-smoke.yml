@@ -22,7 +22,43 @@
 # It runs the COMMITTED dist/ via `uses: ./`, not a fresh build, because the
 # committed bundle is what consumers execute. Proving a rebuilt bundle works
 # would leave the shipped one unverified.
+#
+# ---------------------------------------------------------------------------
+# TWO AXES, DISPATCHED SEPARATELY
+#
+# HCP issues the archive-upload link from a different place depending on how the
+# module was created, so a green run on one axis says nothing about the other.
+# Both end in the same `PUT` this workflow exists to exercise:
+#
+#   - NO-VCS (API-driven). Leave all three `vcs-*` inputs empty. A missing
+#     module is created with no VCS connection at all. This axis has already
+#     run green (navicocloudteam/test-module/aws@0.0.1, 403-byte archive).
+#   - VCS-CONNECTED, UPLOAD-DRIVEN. Supply all three `vcs-*` inputs. A missing
+#     module is created linked to a repo AND a branch, and HCP presigns that
+#     module's versions separately.
+#
+# The axes stay independent: every `vcs-*` input defaults to empty, so a
+# dispatch that touches none of them is byte-for-byte the run that already
+# passed. Nothing is shared between them but the archive and the assertions.
+#
+# THE TRAP BOTH GUARDS BELOW EXIST FOR. A VCS-connected module with NO branch is
+# TAG-based: `src/hcp-publisher.ts` picks the mode with
+# `o.vcsBranch ? 'upload-driven' : 'tag-based'`, and a tag-based publish builds
+# no archive and uploads nothing -- HCP pulls the source from the repo itself.
+# The action reports success, the run goes green, and it has exercised none of
+# the path this workflow was written to exercise. A green run that verifies
+# nothing is worse than no run, so both guards below fail the job BEFORE
+# anything is published rather than after.
 name: HCP smoke (manual)
+
+# Which axis ran, in the runs list, without opening the run. `vcs-branch` is the
+# input that decides upload-driven vs tag-based, so it is the honest thing to
+# label by -- and a dispatch that names an axis the guards then refuse is red,
+# so the label can never be read as a passing run of that axis.
+run-name: >-
+  HCP smoke (${{ inputs.vcs-branch && 'VCS branch axis' || 'no-VCS axis' }}):
+  ${{ inputs.namespace }}/${{ inputs.name }}/${{ inputs.provider }}@${{ inputs.version }}
+
 on:
   workflow_dispatch:
     inputs:
@@ -47,6 +83,38 @@ on:
         description: HCP Terraform / TFE base URL.
         required: true
         default: https://app.terraform.io
+      # The three VCS inputs are ALL-OR-NOTHING and all default to empty, which
+      # is the no-VCS axis. They are plain inputs rather than secrets because
+      # they are identifiers, not bearer credentials: they name an OAuth
+      # connection the organization already holds, and neither one authorizes
+      # anything on its own. The only secret this workflow uses is
+      # HCP_SMOKE_TOKEN.
+      vcs-repo-identifier:
+        description: >-
+          VCS axis: the connected repo as org/repo. HCP derives the module's
+          name and provider from the repo name, so it must be named
+          terraform-<provider>-<name> and must agree with the `name` and
+          `provider` inputs above -- a repo the derived identity does not match
+          creates a module this run then cannot find. Leave empty for the
+          no-VCS axis.
+        required: false
+        default: ""
+      vcs-oauth-token-id:
+        description: >-
+          VCS axis: the organization's VCS OAuth TOKEN id, which is the
+          `ot-...` value. NOT the OAuth CLIENT id, which is `oc-...`: both are
+          org-level ids of similar shape and the client is the easy wrong
+          answer. Leave empty for the no-VCS axis.
+        required: false
+        default: ""
+      vcs-branch:
+        description: >-
+          VCS axis: the branch to connect the module to. REQUIRED whenever the
+          two inputs above are set -- without it HCP creates a TAG-based module,
+          which uploads no archive and would leave this run green having proven
+          nothing. Leave empty for the no-VCS axis.
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -56,6 +124,104 @@ jobs:
     name: Publish a throwaway module version to HCP
     runs-on: ubuntu-latest
     steps:
+      # FIRST, before the checkout and before anything exists in the
+      # organization: a dispatch that cannot prove anything stops here.
+      #
+      # The `vcs-*` inputs are all-or-nothing because every proper subset of
+      # them produces a green, worthless run, and none of them announces itself:
+      #
+      #  - repo and/or token WITHOUT a branch. `createVcsModule` returns
+      #    `o.vcsBranch ? 'upload-driven' : 'tag-based'`, so the module is
+      #    created TAG-based: HCP imports versions from pushed git tags, no
+      #    archive is built and nothing is uploaded, in the one workflow whose
+      #    entire purpose is the upload.
+      #  - a branch WITHOUT both of the others. With NEITHER of the pair set,
+      #    `createMissingModule` falls through to the no-VCS creation, so the
+      #    run silently becomes the axis that is already verified while the
+      #    dispatch says otherwise. With exactly ONE of the pair set the action
+      #    raises its own half-a-pair error, but only mid-publish.
+      - name: Decide which axis this run proves, or refuse to run
+        id: axis
+        env:
+          VCS_REPO_IDENTIFIER: ${{ inputs.vcs-repo-identifier }}
+          VCS_OAUTH_TOKEN_ID: ${{ inputs.vcs-oauth-token-id }}
+          VCS_BRANCH: ${{ inputs.vcs-branch }}
+        run: |
+          set -euo pipefail
+          if [ -z "$VCS_REPO_IDENTIFIER" ] && [ -z "$VCS_OAUTH_TOKEN_ID" ] && [ -z "$VCS_BRANCH" ]; then
+            echo "axis=no-vcs" >> "$GITHUB_OUTPUT"
+            echo "::notice::Axis: no-VCS (API-driven). A missing module is created with no VCS connection and the version is completed by an archive upload."
+            exit 0
+          fi
+          if [ -n "$VCS_REPO_IDENTIFIER" ] && [ -n "$VCS_OAUTH_TOKEN_ID" ] && [ -n "$VCS_BRANCH" ]; then
+            echo "axis=vcs-upload-driven" >> "$GITHUB_OUTPUT"
+            echo "::notice::Axis: VCS-connected, upload-driven ($VCS_REPO_IDENTIFIER on branch $VCS_BRANCH). The version is completed by an archive upload against a module HCP presigns as a VCS module."
+            exit 0
+          fi
+          if [ -z "$VCS_BRANCH" ]; then
+            echo "::error::Refusing to run: VCS inputs were supplied without 'vcs-branch'. That creates a TAG-BASED module, whose versions HCP imports from pushed git tags -- no archive is built and nothing is uploaded, so this run would go green having exercised none of the upload path it exists to verify. Set 'vcs-branch' to run the VCS axis, or clear every vcs-* input to run the no-VCS axis."
+            exit 1
+          fi
+          missing=""
+          [ -n "$VCS_REPO_IDENTIFIER" ] || missing="vcs-repo-identifier"
+          [ -n "$VCS_OAUTH_TOKEN_ID" ] || missing="${missing:+$missing and }vcs-oauth-token-id"
+          echo "::error::Refusing to run: 'vcs-branch' was supplied without $missing. A branch alone connects nothing -- with neither of that pair set the action creates a module with NO VCS connection, which is the axis that is already verified, and with only one of them set it fails mid-publish. Supply all three vcs-* inputs, or clear all three."
+          exit 1
+
+      # The guard above reads the DISPATCH. This one reads the ORGANIZATION,
+      # because for a module that already exists the dispatch does not decide
+      # the publish mode at all: `publish()` takes it from
+      # `publishMode(check.body)` -- HCP's own description of the module -- and
+      # never consults the vcs-* inputs again.
+      #
+      # So a VCS-axis dispatch aimed at a name that already exists WITHOUT a VCS
+      # connection publishes through the no-VCS module: an upload does happen,
+      # every assertion below passes, and the run re-proves the axis that was
+      # already proven while claiming to have proven the other one. That is the
+      # likely mistake rather than an exotic one -- the default `name` is
+      # test-module, and navicocloudteam/test-module/aws already exists, no-VCS,
+      # from the first run of this workflow.
+      #
+      # The same read protects the no-VCS axis in the other direction: pointed
+      # at an existing TAG-based module it would upload nothing at all.
+      #
+      # A 404 is the good case for either axis: the module does not exist, the
+      # action creates it, and which kind it creates is settled by the inputs
+      # the step above has just validated.
+      - name: Refuse a module whose class contradicts the axis
+        env:
+          AXIS: ${{ steps.axis.outputs.axis }}
+          HCP_ADDRESS: ${{ inputs.hcp-address }}
+          HCP_TOKEN: ${{ secrets.HCP_SMOKE_TOKEN }}
+          NAMESPACE: ${{ inputs.namespace }}
+          NAME: ${{ inputs.name }}
+          PROVIDER: ${{ inputs.provider }}
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/hcp-module.json"
+          status=$(curl -sS -o "$body" -w '%{http_code}' \
+            -H "Authorization: Bearer $HCP_TOKEN" \
+            "${HCP_ADDRESS%/}/api/v2/organizations/$NAMESPACE/registry-modules/private/$NAMESPACE/$NAME/$PROVIDER")
+          if [ "$status" = "404" ]; then
+            echo "::notice::$NAMESPACE/$NAME/$PROVIDER does not exist yet; the publish creates it, and the axis decides which kind."
+            exit 0
+          fi
+          if [ "$status" != "200" ]; then
+            echo "::error::Could not read $NAMESPACE/$NAME/$PROVIDER to establish its class (HTTP $status). Refusing to publish against a module whose class is unknown: for a module that already exists it is the class, not the dispatch, that decides whether anything is uploaded."
+            exit 1
+          fi
+          branch=$(jq -r '.data.attributes["vcs-repo"].branch // ""' "$body")
+          connected=$(jq -r 'if .data.attributes["vcs-repo"] then "yes" else "no" end' "$body")
+          echo "existing module: vcs-connected=$connected branch=${branch:-<none>}"
+          if [ "$AXIS" = "vcs-upload-driven" ] && [ -z "$branch" ]; then
+            echo "::error::Refusing to run the VCS axis: $NAMESPACE/$NAME/$PROVIDER already exists and is not a branch-based VCS module (vcs-connected=$connected). The publish mode comes from the module HCP already holds, so this run would upload through the other axis and report a pass for an axis it never touched. Publish the VCS axis to a name that does not exist yet -- HCP derives it from the connected repo -- or delete this module first."
+            exit 1
+          fi
+          if [ "$AXIS" = "no-vcs" ] && [ "$connected" = "yes" ]; then
+            echo "::error::Refusing to run the no-VCS axis: $NAMESPACE/$NAME/$PROVIDER already exists and IS VCS-connected (branch=${branch:-<none>}). The publish mode comes from the module HCP already holds, so this run would exercise the VCS axis -- or, if it is tag-based, upload nothing at all. Pick a name with no VCS connection, or dispatch the VCS axis deliberately."
+            exit 1
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -87,6 +253,9 @@ jobs:
           live HCP Terraform registry. Not intended for use.
           MD
 
+      # The vcs-* inputs pass straight through. All three empty is exactly the
+      # no-VCS dispatch that already ran green, so that axis is unchanged by
+      # this step's existence.
       - name: Publish
         id: publish
         uses: ./
@@ -99,23 +268,48 @@ jobs:
           provider: ${{ inputs.provider }}
           version: ${{ inputs.version }}
           module-directory: smoke-module
+          vcs-repo-identifier: ${{ inputs.vcs-repo-identifier }}
+          vcs-oauth-token-id: ${{ inputs.vcs-oauth-token-id }}
+          vcs-branch: ${{ inputs.vcs-branch }}
 
       # The point of the run. `published` distinguishes "the API accepted our
       # calls" from "the version actually reached a usable state" -- the whole
       # reason this workflow exists is that a version sits at `pending` until
       # the tarball lands, and a mocked test cannot tell the difference.
+      #
+      # `message` then distinguishes "a version exists" from "a version exists
+      # BECAUSE this action uploaded an archive". The action says "with the
+      # module archive uploaded" only on the path that performed the PUT, and
+      # __tests__/hcp-publish.test.ts pins that wording in six cases, so it is a
+      # contract rather than a log line. Every way this run can reach `published
+      # = true` without an upload is caught here and only here: a tag-based
+      # module HCP filled from a git tag, a version-create that came back 422
+      # because the version was burnt on an earlier run, a creation response
+      # that carried no upload link. Each of those is a green run proving
+      # nothing, which is the failure this whole workflow is built against.
       - name: Report what HCP concluded
         env:
+          AXIS: ${{ steps.axis.outputs.axis }}
           PUBLISHED: ${{ steps.publish.outputs.published }}
+          MESSAGE: ${{ steps.publish.outputs.message }}
           VERSION: ${{ inputs.version }}
           MODULE: ${{ inputs.namespace }}/${{ inputs.name }}/${{ inputs.provider }}
         run: |
+          echo "axis:      $AXIS"
           echo "module:    $MODULE"
           echo "version:   $VERSION"
           echo "published: $PUBLISHED"
+          echo "message:   $MESSAGE"
           if [ "$PUBLISHED" != "true" ]; then
             echo "::error::The action did not report the version as published. \
           The upload path is not verified; do not treat this as a pass."
             exit 1
           fi
-          echo "::notice::HCP accepted the archive and the version reached a published state."
+          case "$MESSAGE" in
+            *"module archive uploaded"*) ;;
+            *)
+              echo "::error::The version reached a published state WITHOUT this action uploading an archive, so the upload path is not verified on the $AXIS axis; do not treat this as a pass. A burnt version number is the usual cause -- registry versions are immutable, so re-running with a version that already exists creates nothing and uploads nothing. Dispatch again with a new version."
+              exit 1
+              ;;
+          esac
+          echo "::notice::HCP accepted the archive and the version reached a published state on the $AXIS axis."
