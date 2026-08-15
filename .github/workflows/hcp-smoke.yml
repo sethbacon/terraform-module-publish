@@ -101,10 +101,10 @@ on:
         default: ""
       vcs-oauth-token-id:
         description: >-
-          VCS axis: the organization's VCS OAuth TOKEN id -- `ot-...`, e.g.
-          ot-48RgheoYUn1XU9GB. NOT the OAuth CLIENT id (`oc-...`, e.g.
-          oc-RBRR8dFgvUTKVdQT); both are org-level ids and the client is the
-          easy wrong answer. Leave empty for the no-VCS axis.
+          VCS axis: the organization's VCS OAuth TOKEN id, which is the
+          `ot-...` value. NOT the OAuth CLIENT id, which is `oc-...`: both are
+          org-level ids of similar shape and the client is the easy wrong
+          answer. Leave empty for the no-VCS axis.
         required: false
         default: ""
       vcs-branch:
