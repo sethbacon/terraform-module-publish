@@ -21,6 +21,38 @@ updates:
     commit-message:
       prefix: build(deps)
       prefix-development: build(deps-dev)
+    ignore:
+      # undici majors are held deliberately, and the rule is NOT "majors are
+      # scary". This action hands a userland undici `Agent`/`ProxyAgent` to
+      # Node's BUILT-IN global `fetch` as `init.dispatcher` (see src/http.ts),
+      # so two copies of undici meet on every request that configures TLS
+      # trust or an egress proxy: ours, and the one compiled into the runner's
+      # Node.
+      #
+      # Those two copies have to agree on the dispatcher handler interface.
+      # undici 8.0.0 deleted the wrap-handler shim that had bridged the legacy
+      # interface (nodejs/undici#4786), so its `assertRequestHandler` now hard-
+      # requires onRequestStart/onResponseStart/onResponseData/onResponseEnd.
+      # Node 24's bundled undici (7.21.0 as of Node 24.14) still builds the
+      # LEGACY handler in its fetch, hands it to our dispatcher, and undici 8
+      # rejects it: `InvalidArgumentError: invalid onRequestStart method`
+      # (UND_ERR_INVALID_ARG). Every proxied and every private-CA registry call
+      # fails. undici 7 accepts both shapes, which is why 7.x is the ceiling.
+      #
+      # THE RULE: the userland undici major must not get ahead of the major
+      # that the runner's Node has built in. action.yml runs `using: node24`,
+      # so that is undici 7 and the ceiling is 7.x.
+      #
+      # TO LIFT THIS: check what the target runtime actually bundles —
+      # `node -p process.versions.undici` on the runner, or the `deps/undici`
+      # entry for the Node release the `using:` value maps to. When that reads
+      # 8.x, undici 8 becomes the correct pin and this entry should be raised,
+      # not deleted. The proxy and TLS positive controls in __tests__ are what
+      # verify it; they are real handshakes through a real CONNECT proxy and
+      # they caught this break, so trust them over the release notes.
+      - dependency-name: undici
+        update-types:
+          - version-update:semver-major
 
   # Without this, the SHA pins in the workflows are frozen rather than
   # maintained — pinning without an update path just converts "runs whatever the
