@@ -123,7 +123,16 @@ jobs:
   publish:
     name: Publish a throwaway module version to HCP
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
+      # hardening-exception: egress-audit — this job clones this repository;
+      #   harden-runner has never run in this repository, so no endpoint baseline
+      #   exists and a block policy written without one fails closed on its first run;
+      #   audit is what produces that list
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
       # FIRST, before the checkout and before anything exists in the
       # organization: a dispatch that cannot prove anything stops here.
       #

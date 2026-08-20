@@ -28,9 +28,14 @@ jobs:
   verify:
     name: Verify the tagged tree
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
+      # hardening-exception: egress-audit — this job installs from the npm registry
+      #   and clones this repository; harden-runner has never run in this repository,
+      #   so no endpoint baseline exists and a block policy written without one fails
+      #   closed on its first run; audit is what produces that list
       - uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
@@ -57,7 +62,13 @@ jobs:
           # buys nothing here anyway — this runs once per tag.
           package-manager-cache: false
 
-      - run: npm ci
+      # --ignore-scripts: npm runs dependency preinstall/install/postinstall
+
+      # hooks by default, which is arbitrary code from the dependency tree
+
+      # executing before anything here has inspected it.
+
+      - run: npm ci --ignore-scripts
       - run: npm run lint
       - run: npm test
 
@@ -85,12 +96,18 @@ jobs:
     name: Publish release + provenance
     needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: release
     permissions:
       contents: write # create the GitHub release
       id-token: write # provenance signing
       attestations: write
     steps:
+      # hardening-exception: egress-audit — this job transfers artifacts through the
+      #   Actions API, calls the GitHub API, and clones this repository; harden-runner
+      #   has never run in this repository, so no endpoint baseline exists and a block
+      #   policy written without one fails closed on its first run; audit is what
+      #   produces that list
       - uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit

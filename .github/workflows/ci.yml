@@ -11,14 +11,26 @@ jobs:
   build-test:
     name: Lint, test, dist sync
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
+      # hardening-exception: egress-audit — this job installs from the npm registry
+      #   and clones this repository; harden-runner has never run in this repository,
+      #   so no endpoint baseline exists and a block policy written without one fails
+      #   closed on its first run; audit is what produces that list
+      - name: Harden the runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-      - run: npm ci
+      # --ignore-scripts: npm runs dependency preinstall/install/postinstall
+      # hooks by default, which is arbitrary code from the dependency tree
+      # executing before anything here has inspected it.
+      - run: npm ci --ignore-scripts
       - run: npm run lint
       - run: npm test
       # Split from the staleness diff below so the two failures stay tellable
