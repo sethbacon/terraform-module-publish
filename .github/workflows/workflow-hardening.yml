@@ -1,0 +1,32 @@
+---
+# Workflow-hardening gate, delegated to 4cloudguru/shared-workflows.
+#
+# Asserts four properties are ENFORCED rather than conventionally held: every
+# `uses:` pinned to a full SHA and labelled with the version that SHA is, every
+# job bounded by a timeout, harden-runner running first, and npm installs
+# refusing dependency scripts.
+#
+# script-ref MUST equal the pin on the `uses:` line: the checker is taken from
+# shared-workflows at that commit, so this repo cannot weaken its own gate by
+# editing a local copy -- there is no local copy.
+name: Workflow Hardening
+
+"on":
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workflow-hardening-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workflow-hardening:
+    uses: 4cloudguru/shared-workflows/.github/workflows/workflow-hardening.yml@38cfb353b22eba32ac3ba00f9329e76260e65579 # v1.6.0
+    with:
+      script-ref: 38cfb353b22eba32ac3ba00f9329e76260e65579

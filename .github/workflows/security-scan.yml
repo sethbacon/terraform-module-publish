@@ -28,9 +28,14 @@ jobs:
   audit:
     name: npm audit (runtime deps)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
+      # hardening-exception: egress-audit — this job installs from the npm registry
+      #   and clones this repository; harden-runner has never run in this repository,
+      #   so no endpoint baseline exists and a block policy written without one fails
+      #   closed on its first run; audit is what produces that list
       - uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
@@ -60,9 +65,14 @@ jobs:
   bundle-drift:
     name: Committed dist matches a fresh build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
+      # hardening-exception: egress-audit — this job installs from the npm registry
+      #   and clones this repository; harden-runner has never run in this repository,
+      #   so no endpoint baseline exists and a block policy written without one fails
+      #   closed on its first run; audit is what produces that list
       - uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
@@ -75,7 +85,13 @@ jobs:
         with:
           node-version: 24
 
-      - run: npm ci
+      # --ignore-scripts: npm runs dependency preinstall/install/postinstall
+
+      # hooks by default, which is arbitrary code from the dependency tree
+
+      # executing before anything here has inspected it.
+
+      - run: npm ci --ignore-scripts
       - run: npm run build
 
       - name: Fail if the committed bundle has drifted
@@ -94,10 +110,15 @@ jobs:
   workflows:
     name: Lint workflows (zizmor)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       security-events: write
     steps:
+      # hardening-exception: egress-audit — this job clones this repository;
+      #   harden-runner has never run in this repository, so no endpoint baseline
+      #   exists and a block policy written without one fails closed on its first run;
+      #   audit is what produces that list
       - uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
