@@ -30,9 +30,27 @@ jobs:
       # --ignore-scripts: npm runs dependency preinstall/install/postinstall
       # hooks by default, which is arbitrary code from the dependency tree
       # executing before anything here has inspected it.
-      - run: npm ci --ignore-scripts
+      #
+      # Carries an id and tees its output because the advisory at the foot of
+      # this job has to say WHICH npm ci failure this was. `npm ci` answers a
+      # lockfile that disagrees with package.json by refusing the whole tree
+      # up front: it installs nothing, exits, and leaves every later step
+      # `skipped` rather than `failure` — so an advisory keyed only on those
+      # later steps stays silent on the one failure that caused all of them.
+      # pipefail so tee cannot swallow npm's exit code.
+      - name: Install dependencies
+        id: install
+        run: |
+          set -o pipefail
+          npm ci --ignore-scripts 2>&1 | tee "$RUNNER_TEMP/npm-ci.log"
       - run: npm run lint
       - run: npm test
+      # Executes the advisory's own `run:` block, lifted out of this file,
+      # against real npm output. The advisory is a diagnosis, and the branch
+      # that tells a lockfile refusal from any other npm ci failure keys on
+      # npm's exact wording -- which will change without telling anyone here.
+      - name: The Dependabot advisory still matches npm's wording
+        run: npm run test:advisory
       # Split from the staleness diff below so the two failures stay tellable
       # apart. "This bundle cannot be built at all" and "this bundle is fine but
       # the committed copy is behind it" need opposite responses, and collapsing
@@ -119,12 +137,28 @@ jobs:
           always() &&
           github.event.pull_request.user.login == 'dependabot[bot]' &&
           github.event.pull_request.head.repo.full_name == github.repository &&
-          (steps.rebuild.outcome == 'failure' || steps.dist-sync.outcome == 'failure')
+          (steps.install.outcome == 'failure' ||
+           steps.rebuild.outcome == 'failure' ||
+           steps.dist-sync.outcome == 'failure')
         env:
           HEAD_REF: ${{ github.head_ref }}
+          INSTALL: ${{ steps.install.outcome }}
           REBUILD: ${{ steps.rebuild.outcome }}
+          NPM_CI_LOG: ${{ runner.temp }}/npm-ci.log
         run: |
-          if [ "$REBUILD" = "failure" ]; then
+          if [ "$INSTALL" = "failure" ]; then
+            # Read back what npm actually printed instead of inferring the
+            # cause from the fact that install failed. An advisory that names a
+            # specific defect it has not checked for is worse than a generic
+            # one: it sends the reader to regenerate a lockfile that was never
+            # the problem, with the authority of a diagnosis.
+            if grep -q "can only install packages when your package.json and package-lock.json" "$NPM_CI_LOG"; then
+              missing=$(sed -n 's/.*Missing: \(.*\) from lock file.*/\1/p' "$NPM_CI_LOG" | paste -sd', ' -)
+              echo "::error::Dependabot's lockfile update is incomplete: npm ci refused the tree because package-lock.json disagrees with package.json (missing: ${missing:-see the step log}). Nothing was installed, so the later steps in this job are skipped rather than failed -- the other red checks on this PR are consequences of this one break, not separate problems. The usual cause is optional platform-specific binaries dropped from a transitive bump, which are absent from the lockfile but still required on other architectures. To land it: git fetch origin \"$HEAD_REF\" && git switch \"$HEAD_REF\" && npm install --package-lock-only && git commit -am 'fix(deps): complete the lockfile for this bump' && git push. Check the diff adds only the missing entries before pushing -- if it moves other versions, this is not that failure."
+            else
+              echo "::error::npm ci failed, so nothing else in this job ran and the other red checks on this PR are consequences of it rather than independent findings. This was NOT a lockfile-sync refusal, so neither a rebuild nor 'npm install --package-lock-only' is indicated -- read the 'Install dependencies' step above for npm's actual error before acting."
+            fi
+          elif [ "$REBUILD" = "failure" ]; then
             echo "::error::This bump does not merely need a rebuild — the bundle cannot be built from it. Either the TypeScript compile failed, or esbuild could not resolve a dependency, or the built bundle still resolves one at run time and would die with MODULE_NOT_FOUND (see the 'Rebuild the bundle' step above for which). Committing a rebuilt dist/ here would ship an action that fails before it runs. Close the PR or pin the dependency until upstream is fixed."
           else
             echo "::notice::This bump builds cleanly and the rebuilt bundle passed verification — the only thing missing is the committed dist/. To land it: git fetch origin \"$HEAD_REF\" && git switch \"$HEAD_REF\" && npm ci && npm run build && git commit -am 'build: rebuild dist for this dependency bump' && git push"
