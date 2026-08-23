@@ -9,6 +9,7 @@
     "verify:bundle": "node scripts/verify-bundle.mjs",
     "test": "vitest run --coverage",
     "test:dist": "node scripts/dist-behaviour.mjs",
+    "test:advisory": "node scripts/test-dependabot-advisory.mjs",
     "lint": "tsc --noEmit",
     "test:coverage": "vitest run --coverage"
   },
