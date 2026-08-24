@@ -1,4 +1,3 @@
----
 version: 2
 
 updates:
@@ -17,9 +16,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+      day: monday
+      time: "09:00"
+      timezone: UTC
     commit-message:
-      prefix: build(deps)
+      prefix: "chore(deps)"
       prefix-development: build(deps-dev)
     ignore:
       # undici majors are held deliberately, and the rule is NOT "majors are
@@ -62,12 +63,19 @@ updates:
     # feature bumps and not fixes.
     cooldown:
       default-days: 7
+    groups:
+      npm-dependencies:
+        patterns:
+          - '*'
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: UTC
     commit-message:
-      prefix: ci(deps)
+      prefix: "chore(deps)"
     # codeql-action's init/analyze are separate Dependabot dependencies but are
     # version-locked at runtime, so they have to move in a single PR.
     groups:
