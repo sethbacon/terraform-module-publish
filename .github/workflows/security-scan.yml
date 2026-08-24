@@ -128,3 +128,35 @@ jobs:
           persist-credentials: false
 
       - uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+
+        # DO NOT drop this `with:` block. `advanced-security` defaults to TRUE,
+
+        # which selects --format=sarif -- and there zizmor EXITS 0 WHATEVER IT
+
+        # FINDS. The job goes green and the findings arrive as code-scanning
+
+        # alerts instead, so the gate silently becomes a reporter. This repo was
+
+        # one of five in that state: terraform-drift-contract's "Scan Workflows
+
+        # (zizmor)" reported success on main with three findings open.
+
+        #
+
+        # The version is named rather than left to the action's `latest` default.
+
+        # `latest` is safe -- an alias inside a digest table frozen by the
+
+        # action's own SHA pin, not a tag resolved at runtime -- but it is
+
+        # illegible: the scanner version would appear nowhere in this repository,
+
+        # and bumping the action SHA would silently change which zizmor runs.
+
+        with:
+
+          advanced-security: false
+
+          version: "1.29.0"
+
+          annotations: true
