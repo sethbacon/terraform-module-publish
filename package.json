@@ -14,7 +14,7 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
-    "@4cloudguru/pipeline-task-core": "^0.6.2",
+    "@4cloudguru/pipeline-task-core": "^0.7.0",
     "@actions/core": "^3.0.1",
     "undici": "^7.29.0"
   },
