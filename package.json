@@ -16,16 +16,16 @@
   "dependencies": {
     "@4cloudguru/pipeline-task-core": "^0.9.3",
     "@actions/core": "^3.0.1",
-    "undici": "^7.29.0"
+    "undici": "^7.29.1"
   },
   "overrides": {
     "undici": "$undici"
   },
   "devDependencies": {
     "@types/node": "^26",
-    "@vitest/coverage-v8": "^4.1.11",
+    "@vitest/coverage-v8": "^5.0.0",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.0"
   }
 }
