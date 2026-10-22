@@ -195,7 +195,7 @@ const check = (label, ok, detail = '') => {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}`)
   if (!ok) {
     failures++
-    console.log(`        ${String(detail).replace(/\s+/g, ' ').slice(0, 400)}`)
+    console.log(`        detail: ${String(detail).replace(/\s+/g, ' ').slice(0, 400)}`)
   }
 }
 
