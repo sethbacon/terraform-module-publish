@@ -95,8 +95,8 @@ describe('a remote body reaching the annotation is bounded and stripped', () => 
 
   it('removes control characters, which core.setFailed does not escape', () => {
     // setFailed percent-encodes only %, CR and LF. Everything else in C0 —
-    //  here — survives into the rendered annotation.
-    expect(bodyExcerpt('before[2Jafter')).toBe('before[2Jafter')
+    // \u001b here — survives into the rendered annotation.
+    expect(bodyExcerpt('before\u001b[2Jafter\u0007')).toBe('before[2Jafter')
   })
 
   it('leaves an ordinary short body alone', () => {
@@ -108,7 +108,7 @@ describe('a remote body reaching the annotation is bounded and stripped', () => 
    * are driven to each failure and the message is asserted to be bounded, so a
    * new site added without `bodyExcerpt` fails here rather than in production.
    */
-  const HOSTILE = `[31m${'A'.repeat(40_000)}`
+  const HOSTILE = `\u001b[31m${'A'.repeat(40_000)}`
 
   const privateOptions: PrivateRegistryOptions = {
     namespace: 'acme',
@@ -200,7 +200,7 @@ describe('a remote body reaching the annotation is bounded and stripped', () => 
     expect(error).toBeInstanceOf(Error)
     // Bounded and stripped in the message the runner renders...
     expect(error!.message.length).toBeLessThan(800)
-    expect(error!.message).not.toContain('')
+    expect(error!.message).not.toContain('\u001b')
     expect(error!.message).toMatch(/more characters truncated/)
     // ...and the whole body kept on the debug channel, which core.debug
     // suppresses unless ACTIONS_STEP_DEBUG is set.

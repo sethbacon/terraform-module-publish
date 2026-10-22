@@ -534,7 +534,7 @@ for (const [what, env, expect] of [
 // --------------------------------------------------------------------------
 console.log('\n=== a hostile failure body cannot choose the size of the annotation ===')
 {
-  const hostile = `[31m${'A'.repeat(200_000)}`
+  const hostile = `\u001b[31m${'A'.repeat(200_000)}\u0007`
   const reg = await startRegistry((req, res) => {
     res.writeHead(500, { 'content-type': 'application/json' })
     res.end(hostile)
@@ -553,7 +553,7 @@ console.log('\n=== a hostile failure body cannot choose the size of the annotati
       line.includes('HTTP 500') &&
       /more characters truncated/.test(line) &&
       // eslint-disable-next-line no-control-regex
-      !/[ --]/.test(line),
+      !/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(line),
     `${line.length} chars: ${line.slice(0, 200)}`,
   )
 }
