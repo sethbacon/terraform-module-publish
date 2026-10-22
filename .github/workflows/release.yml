@@ -36,7 +36,7 @@ jobs:
       #   and clones this repository; harden-runner has never run in this repository,
       #   so no endpoint baseline exists and a block policy written without one fails
       #   closed on its first run; audit is what produces that list
-      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: audit
 
@@ -54,7 +54,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           # A release job publishes runtime artifacts, so a poisoned dependency
@@ -108,7 +108,7 @@ jobs:
       #   has never run in this repository, so no endpoint baseline exists and a block
       #   policy written without one fails closed on its first run; audit is what
       #   produces that list
-      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: audit
 
@@ -117,7 +117,7 @@ jobs:
           persist-credentials: false
 
       - name: Generate SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: cyclonedx-json
